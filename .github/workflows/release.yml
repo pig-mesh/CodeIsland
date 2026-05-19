@@ -14,20 +14,38 @@ jobs:
       - name: Extract version from tag
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
 
+      - name: Check Homebrew tap token
+        id: homebrew-token
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -n "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "HOMEBREW_TAP_TOKEN is not configured; skipping Homebrew tap update."
+          fi
+
       - name: Download DMG from release
+        if: steps.homebrew-token.outputs.available == 'true'
         run: |
           curl -L \
-            "https://github.com/wxtsky/CodeIsland/releases/download/v${VERSION}/CodeIsland.dmg" \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/CodeIsland.dmg" \
             -o CodeIsland.dmg
 
       - name: Compute SHA256
+        if: steps.homebrew-token.outputs.available == 'true'
         run: echo "SHA256=$(sha256sum CodeIsland.dmg | awk '{print $1}')" >> $GITHUB_ENV
 
       - name: Clone homebrew-tap
+        if: steps.homebrew-token.outputs.available == 'true'
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          git clone "https://x-access-token:${{ secrets.HOMEBREW_TAP_TOKEN }}@github.com/wxtsky/homebrew-tap.git" homebrew-tap
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/wxtsky/homebrew-tap.git" homebrew-tap
 
       - name: Update Cask formula
+        if: steps.homebrew-token.outputs.available == 'true'
         run: |
           mkdir -p homebrew-tap/Casks
           cat > homebrew-tap/Casks/codeisland.rb <<'CASK_EOF'
@@ -52,6 +70,7 @@ jobs:
           sed -i 's/^          //' homebrew-tap/Casks/codeisland.rb
 
       - name: Commit and push to homebrew-tap
+        if: steps.homebrew-token.outputs.available == 'true'
         run: |
           cd homebrew-tap
           git config user.name "github-actions[bot]"
