@@ -19,7 +19,10 @@ jobs:
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          if [ -n "$HOMEBREW_TAP_TOKEN" ]; then
+          if [ "$GITHUB_REPOSITORY" != "wxtsky/CodeIsland" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping Homebrew tap update for fork repository $GITHUB_REPOSITORY."
+          elif [ -n "$HOMEBREW_TAP_TOKEN" ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
@@ -76,5 +79,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Casks/codeisland.rb
+          if git diff --cached --quiet; then
+            echo "Homebrew cask is already up to date."
+            exit 0
+          fi
           git commit -m "Update codeisland to ${VERSION}"
           git push
