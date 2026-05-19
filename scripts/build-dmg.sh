@@ -74,18 +74,24 @@ CURRENT_VER=$(defaults read "$REPO_ROOT/Info.plist" CFBundleShortVersionString)
 sed -e "s/<string>${CURRENT_VER}<\/string>/<string>${VERSION}<\/string>/g" \
     "$REPO_ROOT/Info.plist" > "$CONTENTS_DIR/Info.plist"
 
-# Compile app icon and asset catalog
-xcrun actool \
-    --output-format human-readable-text \
-    --notices --warnings --errors \
-    --platform macosx \
-    --target-device mac \
-    --minimum-deployment-target 14.0 \
-    --app-icon AppIcon \
-    --output-partial-info-plist /dev/null \
-    --compile "$CONTENTS_DIR/Resources" \
-    "$REPO_ROOT/Assets.xcassets" \
-    "$REPO_ROOT/AppIcon.icon"
+# Compile app icon and asset catalog locally, but use the checked-in compiled
+# assets on CI where AppIcon.icon compilation is unstable on macos-15 runners.
+if [ "${USE_PREBUILT_ASSETS:-${CI:-0}}" = "1" ] || [ "${USE_PREBUILT_ASSETS:-${CI:-0}}" = "true" ]; then
+    cp "$REPO_ROOT/Sources/CodeIsland/Resources/AppIcon.icns" "$CONTENTS_DIR/Resources/AppIcon.icns"
+    cp "$REPO_ROOT/Sources/CodeIsland/Resources/Assets.car" "$CONTENTS_DIR/Resources/Assets.car"
+else
+    xcrun actool \
+        --output-format human-readable-text \
+        --notices --warnings --errors \
+        --platform macosx \
+        --target-device mac \
+        --minimum-deployment-target 14.0 \
+        --app-icon AppIcon \
+        --output-partial-info-plist /dev/null \
+        --compile "$CONTENTS_DIR/Resources" \
+        "$REPO_ROOT/Assets.xcassets" \
+        "$REPO_ROOT/AppIcon.icon"
+fi
 
 # Copy SPM resource bundles into Contents/Resources/ — putting them at the .app
 # root breaks Developer ID signing with "unsealed contents present in the bundle
