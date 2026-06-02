@@ -46,7 +46,7 @@
 #define BL_BRIGHT_IDLE     40   // very dim after idle timeout
 #define BL_IDLE_TIMEOUT_MS 30000UL
 #define BL_SLEEP_AFTER_MS 30000UL
-#define SCREEN_OFF_TIMEOUT_MS 60000UL
+#define SCREEN_OFF_TIMEOUT_MS 300000UL
 #define BL_SLEEP_PERCENT 15
 
 // --- Frame rate control ---
@@ -136,6 +136,9 @@ volatile uint16_t bleConnId = 0;
 volatile bool     bleConnIdValid = false;
 volatile unsigned long lastBleData = 0;
 volatile unsigned long lastWakeActivity = 0;
+volatile bool     taskTimerActive = false;
+volatile unsigned long taskTimerStart = 0;
+volatile uint8_t  taskTimerSourceId = 0xFF;
 volatile uint8_t  buddyBrightnessPercent = BUDDY_BRIGHTNESS_DEFAULT_PERCENT;
 volatile uint8_t  buddyScreenOrientation = BUDDY_SCREEN_UP;
 volatile bool     buddyOrientationDirty = false;
@@ -331,6 +334,10 @@ static const char* statusStr(uint8_t s) {
 }
 
 bool statusKeepsScreenAwake(uint8_t status) {
+  return status == 1 || status == 2 || status == 3 || status == 4;
+}
+
+bool statusHasTaskTimer(uint8_t status) {
   return status == 1 || status == 2 || status == 3 || status == 4;
 }
 
@@ -819,13 +826,28 @@ class CharCallbacks : public BLECharacteristicCallbacks {
       return;
     }
 
+    unsigned long now_write = millis();
+    uint8_t nextSourceId = data[0];
+    uint8_t nextStatusId = data[1];
+
     portENTER_CRITICAL(&bleMux);
-    if (bleSourceId != data[0]) headerDirty = true;
-    if (bleStatusId != data[1]) infoDirty = true;
-    bleSourceId = data[0];
-    bleStatusId = data[1];
+    if (bleSourceId != nextSourceId) headerDirty = true;
+    if (bleStatusId != nextStatusId) infoDirty = true;
+    if (statusHasTaskTimer(nextStatusId)) {
+      if (!taskTimerActive || taskTimerSourceId != nextSourceId) {
+        taskTimerActive = true;
+        taskTimerStart = now_write;
+        taskTimerSourceId = nextSourceId;
+      }
+    } else {
+      taskTimerActive = false;
+      taskTimerStart = 0;
+      taskTimerSourceId = 0xFF;
+    }
+    bleSourceId = nextSourceId;
+    bleStatusId = nextStatusId;
     if (statusKeepsScreenAwake(bleStatusId)) {
-      lastWakeActivity = millis();
+      lastWakeActivity = now_write;
     }
     uint8_t toolLen = data[2];
     if (toolLen > 17) toolLen = 17;
@@ -834,9 +856,8 @@ class CharCallbacks : public BLECharacteristicCallbacks {
       memcpy(bleToolName, data + 3, toolLen);
     }
     bleToolName[toolLen] = '\0';
-    lastBleData = millis();
+    lastBleData = now_write;
     appMode = MODE_AGENT;
-    unsigned long now_write = millis();
     if (lastBleWriteTime > 0) {
       bleWriteInterval = now_write - lastBleWriteTime;
     }
@@ -927,6 +948,54 @@ void drawAgentLamp(AgentLampState state, float t) {
 
   fillLampCircle(cx, cy, outerRadius, r, g, b, breath * 0.34f);
   fillLampCircle(cx, cy, coreRadius, r, g, b, 0.46f + breath * 0.54f);
+}
+
+void formatTaskElapsed(char* buf, size_t bufSize, unsigned long elapsedSeconds) {
+  if (elapsedSeconds > 999) elapsedSeconds = 999;
+  snprintf(buf, bufSize, "%lu", elapsedSeconds);
+}
+
+void drawTaskTimer(unsigned long now, AgentLampState state) {
+  bool localTimerActive;
+  unsigned long localTaskStart;
+  portENTER_CRITICAL(&bleMux);
+  localTimerActive = taskTimerActive;
+  localTaskStart = taskTimerStart;
+  portEXIT_CRITICAL(&bleMux);
+  if (!localTimerActive || localTaskStart == 0 || now < localTaskStart) return;
+
+  char timeBuf[10];
+  formatTaskElapsed(timeBuf, sizeof(timeBuf), (now - localTaskStart) / 1000);
+
+  const uint8_t textSize = 5;
+  int16_t tw = strlen(timeBuf) * 6 * textSize;
+  int16_t th = 8 * textSize;
+  int16_t x = (LCD_W - tw) / 2;
+  int16_t y = 150 - th / 2;
+
+  uint16_t shadowColor = RGB565(248, 252, 245);
+  uint16_t textColor = RGB565(0, 18, 8);
+  if (state == LAMP_WAIT) {
+    shadowColor = RGB565(255, 248, 190);
+    textColor = RGB565(42, 28, 0);
+  } else if (state == LAMP_ERROR) {
+    shadowColor = RGB565(28, 0, 4);
+    textColor = RGB565(255, 245, 245);
+  }
+
+  gfx->setTextSize(textSize);
+  gfx->setTextColor(shadowColor);
+  gfx->setCursor(x - 2, y);
+  gfx->print(timeBuf);
+  gfx->setCursor(x + 2, y);
+  gfx->print(timeBuf);
+  gfx->setCursor(x, y - 2);
+  gfx->print(timeBuf);
+  gfx->setCursor(x, y + 2);
+  gfx->print(timeBuf);
+  gfx->setTextColor(textColor);
+  gfx->setCursor(x, y);
+  gfx->print(timeBuf);
 }
 
 // --- Draw tool name label ---
@@ -1505,6 +1574,9 @@ void loop() {
       bleStatusId = 0;
       bleToolName[0] = '\0';
       pendingAnim = ANIM_NONE;
+      taskTimerActive = false;
+      taskTimerStart = 0;
+      taskTimerSourceId = 0xFF;
       infoDirty = true;
       clearedStaleAgentState = true;
     }
@@ -1604,6 +1676,9 @@ void loop() {
     // Header area (y=0..16)
     drawStatusBar();
     drawMascotName(drawIdx);
+    if (lampOnlyScene) {
+      drawTaskTimer(now, lampState);
+    }
 
     // Mascot animation area (y=16..220)
     Mascot& m = mascots[drawIdx];
