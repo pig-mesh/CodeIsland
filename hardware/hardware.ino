@@ -900,10 +900,18 @@ void drawMascotName(uint8_t idx) {
   if (localModel[0] != '\0') {
     char headerBuf[40];
     snprintf(headerBuf, sizeof(headerBuf), "%s · %s", name, localModel);
-    int16_t tw = strlen(headerBuf) * 6;
-    gfx->setTextSize(1);
+    const uint8_t textSize = 2;
+    const uint8_t maxChars = LCD_W / (6 * textSize);
+    if (strlen(headerBuf) > maxChars) {
+      headerBuf[maxChars - 3] = '.';
+      headerBuf[maxChars - 2] = '.';
+      headerBuf[maxChars - 1] = '.';
+      headerBuf[maxChars] = '\0';
+    }
+    int16_t tw = strlen(headerBuf) * 6 * textSize;
+    gfx->setTextSize(textSize);
     gfx->setTextColor(RGB565(160, 160, 170));
-    gfx->setCursor((LCD_W - tw) / 2, 8);
+    gfx->setCursor((LCD_W - tw) / 2, 4);
     gfx->print(headerBuf);
   } else {
     gfx->setTextSize(2);
