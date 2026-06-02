@@ -211,6 +211,7 @@ char prevWorkspaceName[20] = {0};
 
 // --- Scenes ---
 enum Scene { SCENE_SLEEP, SCENE_WORK, SCENE_ALERT, SCENE_QUESTION, SCENE_COUNT };
+enum AgentLampState { LAMP_OFF, LAMP_GO, LAMP_WAIT, LAMP_ERROR };
 
 // --- App mode ---
 enum AppMode { MODE_ONBOARD, MODE_DEMO, MODE_AGENT, MODE_PAIR_CONFIRM };
@@ -330,7 +331,7 @@ static const char* statusStr(uint8_t s) {
 }
 
 bool statusKeepsScreenAwake(uint8_t status) {
-  return status == 1 || status == 2 || status == 4;
+  return status == 1 || status == 2 || status == 3 || status == 4;
 }
 
 uint8_t clampBuddyBrightness(uint8_t percent) {
@@ -858,6 +859,74 @@ Scene statusToScene(uint8_t status) {
     case 4: return SCENE_QUESTION;    // waitingQuestion
     default: return SCENE_SLEEP;
   }
+}
+
+AgentLampState statusToLampState(uint8_t status, bool errorActive) {
+  if (errorActive) return LAMP_ERROR;
+  if (status == 1 || status == 2) return LAMP_GO;
+  if (status == 3 || status == 4) return LAMP_WAIT;
+  return LAMP_OFF;
+}
+
+uint8_t lampChannel(uint8_t value, float scale) {
+  int scaled = (int)(value * scale);
+  if (scaled < 0) return 0;
+  if (scaled > 255) return 255;
+  return (uint8_t)scaled;
+}
+
+void fillLampCircle(int16_t cx, int16_t cy, int16_t radius,
+                    uint8_t r, uint8_t g, uint8_t b, float scale) {
+  if (radius <= 0 || scale <= 0.0f) return;
+  gfx->fillCircle(cx, cy, radius,
+    RGB565(lampChannel(r, scale), lampChannel(g, scale), lampChannel(b, scale)));
+}
+
+float agentLampBreath(AgentLampState state, float t) {
+  if (state != LAMP_ERROR) {
+    float period = state == LAMP_WAIT ? 3.0f : 3.4f;
+    float wave = (sinf((t / period) * 2.0f * PI - PI / 2.0f) + 1.0f) * 0.5f;
+    float eased = wave * wave * (3.0f - 2.0f * wave);
+    return 0.52f + eased * 0.44f;
+  }
+
+  float period = 1.25f;
+  float p = fmodf(t, period);
+  float firstBeat = p < 0.18f ? sinf((p / 0.18f) * PI) : 0.0f;
+  float secondBeat = (p > 0.28f && p < 0.46f) ? sinf(((p - 0.28f) / 0.18f) * PI) : 0.0f;
+  float peak = fmaxf(firstBeat, secondBeat * 0.82f);
+  float base = 0.48f;
+  return base + peak * (1.0f - base);
+}
+
+void drawAgentLamp(AgentLampState state, float t) {
+  if (state == LAMP_OFF) return;
+
+  uint8_t r = 0;
+  uint8_t g = 0;
+  uint8_t b = 0;
+  switch (state) {
+    case LAMP_GO:
+      r = 0; g = 255; b = 28;
+      break;
+    case LAMP_WAIT:
+      r = 255; g = 204; b = 0;
+      break;
+    case LAMP_ERROR:
+      r = 255; g = 20; b = 42;
+      break;
+    default:
+      return;
+  }
+
+  float breath = agentLampBreath(state, t);
+  int16_t cx = LCD_W / 2;
+  int16_t cy = 150;
+  int16_t outerRadius = (int16_t)(136 + breath * 24);
+  int16_t coreRadius = min((int16_t)(34 + breath * 55), (int16_t)(LCD_W / 2));
+
+  fillLampCircle(cx, cy, outerRadius, r, g, b, breath * 0.34f);
+  fillLampCircle(cx, cy, coreRadius, r, g, b, 0.46f + breath * 0.54f);
 }
 
 // --- Draw tool name label ---
@@ -1488,6 +1557,7 @@ void loop() {
     drawOnboardScreen(t);
   } else {
     uint8_t drawIdx;
+    uint8_t drawStatus = 0;
     Scene drawScene;
 
     if (appMode == MODE_DEMO) {
@@ -1507,9 +1577,29 @@ void loop() {
       }
       drawScene = currentScene;
     } else {
+      drawStatus = bleStatusId;
       drawIdx = bleSourceId < NUM_MASCOTS ? bleSourceId : 0;
-      drawScene = statusToScene(bleStatusId);
+      drawScene = statusToScene(drawStatus);
     }
+
+    TransientAnim localPendingAnim;
+    unsigned long localAnimStartTime;
+    portENTER_CRITICAL(&bleMux);
+    localPendingAnim = pendingAnim;
+    localAnimStartTime = animStartTime;
+    portEXIT_CRITICAL(&bleMux);
+
+    AgentLampState lampState = LAMP_OFF;
+    if (appMode == MODE_AGENT) {
+      bool transientActive = localPendingAnim != ANIM_NONE && (now - localAnimStartTime) < ANIM_DURATION_MS;
+      bool errorLampActive = localPendingAnim == ANIM_FRUSTRATED && transientActive;
+      lampState = statusToLampState(drawStatus, errorLampActive);
+      if (lampState == LAMP_OFF && localPendingAnim == ANIM_CELEBRATE && transientActive) {
+        lampState = LAMP_GO;
+      }
+      drawAgentLamp(lampState, t);
+    }
+    bool lampOnlyScene = appMode == MODE_AGENT && lampState != LAMP_OFF;
 
     // Header area (y=0..16)
     drawStatusBar();
@@ -1520,13 +1610,17 @@ void loop() {
 
     // Check transient animations
     bool playingTransient = false;
-    TransientAnim localPendingAnim;
-    unsigned long localAnimStartTime;
-    portENTER_CRITICAL(&bleMux);
-    localPendingAnim = pendingAnim;
-    localAnimStartTime = animStartTime;
-    portEXIT_CRITICAL(&bleMux);
-    if (localPendingAnim != ANIM_NONE && (now - localAnimStartTime) < ANIM_DURATION_MS) {
+    if (lampOnlyScene) {
+      globalBored = false;
+      globalBoredEyeOffsetX = 0.0f;
+      if (localPendingAnim != ANIM_NONE && (now - localAnimStartTime) >= ANIM_DURATION_MS) {
+        portENTER_CRITICAL(&bleMux);
+        if (pendingAnim == localPendingAnim && animStartTime == localAnimStartTime) {
+          pendingAnim = ANIM_NONE;
+        }
+        portEXIT_CRITICAL(&bleMux);
+      }
+    } else if (localPendingAnim != ANIM_NONE && (now - localAnimStartTime) < ANIM_DURATION_MS) {
       playingTransient = true;
       if (localPendingAnim == ANIM_CELEBRATE) {
         drawCelebration(t, drawIdx, localAnimStartTime);
@@ -1590,7 +1684,7 @@ void loop() {
       } else if (drawScene == SCENE_ALERT || drawScene == SCENE_QUESTION) {
         drawWorkspaceLabel(268);
         drawToolLabel(286);
-        drawAlertActionHints(bleStatusId);
+        drawAlertActionHints(drawStatus);
       } else {
         drawWorkspaceLabel(286);
         drawToolLabel(304);
