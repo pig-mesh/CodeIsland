@@ -142,6 +142,10 @@ install_name_tool -add_rpath "@executable_path/../Frameworks" \
     "$CONTENTS_DIR/MacOS/CodeIsland"
 echo "==> Added @executable_path/../Frameworks rpath to CodeIsland binary"
 
+# Sparkle's binary artifact can carry FinderInfo/resource-fork xattrs after
+# extraction. Those make strict codesign validation reject the final bundle.
+xattr -cr "$APP_DIR"
+
 echo "==> App bundle assembled at $APP_DIR"
 
 # ---------------------------------------------------------------------------
@@ -232,6 +236,7 @@ rm -f "$OUTPUT_DMG"
 
 create-dmg \
     --volname "CodeIsland ${VERSION}" \
+    --filesystem APFS \
     --window-pos 200 120 \
     --window-size 600 400 \
     --icon-size 100 \
@@ -239,7 +244,7 @@ create-dmg \
     --hide-extension "CodeIsland.app" \
     --app-drop-link 425 190 \
     --no-internet-enable \
-    --sandbox-safe \
+    --skip-jenkins \
     "$OUTPUT_DMG" \
     "$STAGING_DIR/"
 

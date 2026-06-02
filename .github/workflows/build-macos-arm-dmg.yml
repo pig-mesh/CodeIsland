@@ -68,6 +68,8 @@ jobs:
           test "$APP_ARCHS" = "arm64"
           test "$HELPER_ARCHS" = "arm64"
           test "$SPARKLE_ARCHS" = "arm64"
+          codesign --verify --deep --strict --verbose=2 .build/dmg-staging/CodeIsland.app
+          hdiutil verify .build/CodeIsland.dmg
           ls -lh .build/CodeIsland.dmg
 
       - name: Upload DMG artifact
