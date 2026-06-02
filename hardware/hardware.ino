@@ -42,10 +42,12 @@
 #define BL_PWM_CHANNEL  0
 #define BL_PWM_FREQ     5000
 #define BL_PWM_BITS     8
-#define BL_BRIGHT_ACTIVE  180   // 0-255, lower = cooler (default was 255)
-#define BL_BRIGHT_SLEEP    80   // dimmer in sleep scene
+#define BL_BRIGHT_ACTIVE  210   // 0-255, lower = cooler (default was 255)
 #define BL_BRIGHT_IDLE     40   // very dim after idle timeout
 #define BL_IDLE_TIMEOUT_MS 30000UL
+#define BL_SLEEP_AFTER_MS 30000UL
+#define SCREEN_OFF_TIMEOUT_MS 60000UL
+#define BL_SLEEP_PERCENT 15
 
 // --- Frame rate control ---
 #define FPS_ACTIVE  25
@@ -133,6 +135,7 @@ volatile bool     bleConnected = false;
 volatile uint16_t bleConnId = 0;
 volatile bool     bleConnIdValid = false;
 volatile unsigned long lastBleData = 0;
+volatile unsigned long lastWakeActivity = 0;
 volatile uint8_t  buddyBrightnessPercent = BUDDY_BRIGHTNESS_DEFAULT_PERCENT;
 volatile uint8_t  buddyScreenOrientation = BUDDY_SCREEN_UP;
 volatile bool     buddyOrientationDirty = false;
@@ -326,6 +329,10 @@ static const char* statusStr(uint8_t s) {
   }
 }
 
+bool statusKeepsScreenAwake(uint8_t status) {
+  return status == 1 || status == 2 || status == 4;
+}
+
 uint8_t clampBuddyBrightness(uint8_t percent) {
   if (percent < BUDDY_BRIGHTNESS_MIN_PERCENT) return BUDDY_BRIGHTNESS_MIN_PERCENT;
   if (percent > BUDDY_BRIGHTNESS_MAX_PERCENT) return BUDDY_BRIGHTNESS_MAX_PERCENT;
@@ -363,7 +370,9 @@ uint8_t activeBrightness() {
 }
 
 uint8_t sleepBrightness() {
-  return scaledBrightness(BL_BRIGHT_SLEEP);
+  uint8_t active = activeBrightness();
+  uint8_t sleeping = (uint8_t)(active * BL_SLEEP_PERCENT / 100);
+  return sleeping < 1 ? 1 : sleeping;
 }
 
 uint8_t idleBrightness() {
@@ -814,6 +823,9 @@ class CharCallbacks : public BLECharacteristicCallbacks {
     if (bleStatusId != data[1]) infoDirty = true;
     bleSourceId = data[0];
     bleStatusId = data[1];
+    if (statusKeepsScreenAwake(bleStatusId)) {
+      lastWakeActivity = millis();
+    }
     uint8_t toolLen = data[2];
     if (toolLen > 17) toolLen = 17;
     memset(bleToolName, 0, sizeof(bleToolName));
@@ -909,11 +921,23 @@ void drawWorkspaceLabel(int baseY = 224) {
   memcpy(localWs, bleWorkspaceName, sizeof(localWs));
   portEXIT_CRITICAL(&bleMux);
   if (localWs[0] == '\0') return;
+  char displayWs[20];
+  memcpy(displayWs, localWs, sizeof(displayWs));
+  const uint8_t textSize = 2;
+  const uint8_t maxChars = LCD_W / (6 * textSize);
+  size_t len = strlen(displayWs);
+  if (len > maxChars) {
+    displayWs[maxChars - 3] = '.';
+    displayWs[maxChars - 2] = '.';
+    displayWs[maxChars - 1] = '.';
+    displayWs[maxChars] = '\0';
+  }
   gfx->setTextColor(RGB565(80, 180, 220));
-  gfx->setTextSize(1);
-  int16_t tw = strlen(localWs) * 6;
-  gfx->setCursor((LCD_W - tw) / 2, baseY);
-  gfx->print(localWs);
+  gfx->setTextSize(textSize);
+  int16_t tw = strlen(displayWs) * 6 * textSize;
+  int16_t x = (LCD_W - tw) / 2;
+  gfx->setCursor(x < 0 ? 0 : x, baseY);
+  gfx->print(displayWs);
 }
 
 // --- Draw action hints for Alert/Question scenes (y=300) ---
@@ -1207,6 +1231,7 @@ void setup() {
 
   lastSceneChange = millis();
   lastInteraction = millis();
+  lastWakeActivity = millis();
   lastFrameTime = millis();
   lastFpsCalcTime = millis();
 
@@ -1262,6 +1287,12 @@ void loop() {
 
   // Button handling
   int btn = pollButton(now);
+  if (btn != 0) {
+    lastWakeActivity = now;
+  }
+  if (appMode == MODE_AGENT && statusKeepsScreenAwake(bleStatusId)) {
+    lastWakeActivity = now;
+  }
 
   // Super-long-press detection (3s): clear pairing (factory reset) from
   // ONBOARD/DEMO/AGENT modes. MODE_PAIR_CONFIRM uses normal long press.
@@ -1384,20 +1415,36 @@ void loop() {
     }
   }
 
-  // BLE timeout: agent mode -> back to previous mode
+  unsigned long wakeIdleMs = now - lastWakeActivity;
+  bool agentLowPowerSleep = appMode == MODE_AGENT && wakeIdleMs >= BL_SLEEP_AFTER_MS;
+  bool screenOff = appMode == MODE_AGENT && wakeIdleMs >= SCREEN_OFF_TIMEOUT_MS;
+
+  // BLE timeout means the agent data is stale. Stay in AGENT idle/sleep/off
+  // instead of returning to the onboarding QR screen during normal use.
   if (appMode == MODE_AGENT && (now - lastBleData) > BLE_TIMEOUT_MS) {
-    appMode = hasEverConnected ? MODE_ONBOARD : MODE_ONBOARD;
-    Serial.printf("[BLE]  Timeout (%lus no data), -> %s\n", BLE_TIMEOUT_MS / 1000, appModeStr(appMode));
+    bool clearedStaleAgentState = false;
+    portENTER_CRITICAL(&bleMux);
+    if (bleStatusId != 0 || bleToolName[0] != '\0' || pendingAnim != ANIM_NONE) {
+      bleStatusId = 0;
+      bleToolName[0] = '\0';
+      pendingAnim = ANIM_NONE;
+      infoDirty = true;
+      clearedStaleAgentState = true;
+    }
+    portEXIT_CRITICAL(&bleMux);
+    if (clearedStaleAgentState) {
+      Serial.printf("[BLE]  Timeout (%lus no data), -> AGENT idle\n", BLE_TIMEOUT_MS / 1000);
+    }
   }
 
   // Dynamic backlight brightness (with night mode)
   uint8_t targetBright;
-  if (appMode == MODE_PAIR_CONFIRM) {
+  if (screenOff) {
+    targetBright = 0;
+  } else if (appMode == MODE_PAIR_CONFIRM) {
     targetBright = activeBrightness();
-  } else if (appMode == MODE_AGENT && bleConnected) {
-    lastInteraction = now;
-    Scene agentScene = statusToScene(bleStatusId);
-    targetBright = (agentScene == SCENE_SLEEP) ? sleepBrightness() : activeBrightness();
+  } else if (appMode == MODE_AGENT) {
+    targetBright = agentLowPowerSleep ? sleepBrightness() : activeBrightness();
   } else if ((now - lastInteraction) > BL_IDLE_TIMEOUT_MS) {
     targetBright = idleBrightness();
   } else if (appMode == MODE_ONBOARD) {
@@ -1424,6 +1471,7 @@ void loop() {
   }
 
   // ---- Render ----
+  if (!screenOff) {
   canvas.fillScreen(0x0000);
 
   if (appMode == MODE_PAIR_CONFIRM) {
@@ -1527,22 +1575,23 @@ void loop() {
     // Info area (AGENT mode only)
     if (appMode == MODE_AGENT && !playingTransient) {
       if (drawScene == SCENE_SLEEP) {
-        drawWorkspaceLabel(224);
+        drawWorkspaceLabel(218);
         drawStatsPanel();
         drawToolTimeline();
         drawHeatmapBar();
       } else if (drawScene == SCENE_ALERT || drawScene == SCENE_QUESTION) {
-        drawWorkspaceLabel(274);
+        drawWorkspaceLabel(268);
         drawToolLabel(286);
         drawAlertActionHints(bleStatusId);
       } else {
-        drawWorkspaceLabel(292);
+        drawWorkspaceLabel(286);
         drawToolLabel(304);
       }
     }
   }
 
   tft.drawRGBBitmap(0, 0, canvas.getBuffer(), LCD_W, LCD_H);
+  }
 
   // NVS debounce write
   if ((now - lastNvsSave) > NVS_DEBOUNCE_MS) {
