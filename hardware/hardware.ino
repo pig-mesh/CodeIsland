@@ -34,7 +34,7 @@
 #define BACKLIGHT_ACTIVE_HIGH true
 #define LCD_W    172
 #define LCD_H    320
-#define LCD_ROT  0
+#define LCD_ROT  2
 #define DEBOUNCE_MS 30
 #define LONG_PRESS_MS 600
 
