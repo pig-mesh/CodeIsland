@@ -70,6 +70,16 @@ jobs:
           test "$SPARKLE_ARCHS" = "arm64"
           codesign --verify --deep --strict --verbose=2 .build/dmg-staging/CodeIsland.app
           hdiutil verify .build/CodeIsland.dmg
+          MOUNT_DIR="$(mktemp -d)"
+          cleanup_mount() {
+            hdiutil detach "$MOUNT_DIR" -quiet 2>/dev/null || true
+            rmdir "$MOUNT_DIR" 2>/dev/null || true
+          }
+          trap cleanup_mount EXIT
+          hdiutil attach .build/CodeIsland.dmg -readonly -nobrowse -mountpoint "$MOUNT_DIR" -quiet
+          codesign --verify --deep --strict --verbose=2 "$MOUNT_DIR/CodeIsland.app"
+          cleanup_mount
+          trap - EXIT
           ls -lh .build/CodeIsland.dmg
 
       - name: Upload DMG artifact
