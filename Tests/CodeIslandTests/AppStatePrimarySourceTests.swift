@@ -189,14 +189,15 @@ final class AppStatePrimarySourceTests: XCTestCase {
         session.status = .processing
         session.userPromptSequence = 1
 
+        let alphaKey = ESP32Protocol.sessionKey(for: "session-alpha")
         let first = tracker.update(displaySessionId: "session-alpha", session: session, now: start, failedWhenEnding: false)
-        XCTAssertEqual(first, .active(elapsedSeconds: 0, taskRunSeq: 1, taskIdShort: "alpha-1"))
+        XCTAssertEqual(first, .active(elapsedSeconds: 0, taskRunSeq: 1, sessionKey: alphaKey, taskIdShort: "alpha-1"))
 
         let duplicate = tracker.update(displaySessionId: "session-alpha", session: session, now: start.addingTimeInterval(0.4), failedWhenEnding: false)
         XCTAssertNil(duplicate)
 
         let second = tracker.update(displaySessionId: "session-alpha", session: session, now: start.addingTimeInterval(1.2), failedWhenEnding: false)
-        XCTAssertEqual(second, .active(elapsedSeconds: 1, taskRunSeq: 1, taskIdShort: "alpha-1"))
+        XCTAssertEqual(second, .active(elapsedSeconds: 1, taskRunSeq: 1, sessionKey: alphaKey, taskIdShort: "alpha-1"))
     }
 
     func testBuddyTaskRunTrackerKeepsCountingWhileWaiting() {
@@ -209,7 +210,7 @@ final class AppStatePrimarySourceTests: XCTestCase {
 
         session.status = .waitingApproval
         let waiting = tracker.update(displaySessionId: "s1", session: session, now: start.addingTimeInterval(3), failedWhenEnding: false)
-        XCTAssertEqual(waiting, .active(elapsedSeconds: 3, taskRunSeq: 1, taskIdShort: "s1-1"))
+        XCTAssertEqual(waiting, .active(elapsedSeconds: 3, taskRunSeq: 1, sessionKey: ESP32Protocol.sessionKey(for: "s1"), taskIdShort: "s1-1"))
     }
 
     func testBuddyTaskRunTrackerPreservesTimersAcrossRotatedSessions() {
@@ -224,15 +225,15 @@ final class AppStatePrimarySourceTests: XCTestCase {
 
         XCTAssertEqual(
             tracker.update(displaySessionId: "s1", session: first, now: start, failedWhenEnding: false),
-            .active(elapsedSeconds: 0, taskRunSeq: 1, taskIdShort: "s1-1")
+            .active(elapsedSeconds: 0, taskRunSeq: 1, sessionKey: ESP32Protocol.sessionKey(for: "s1"), taskIdShort: "s1-1")
         )
         XCTAssertEqual(
             tracker.update(displaySessionId: "s2", session: second, now: start.addingTimeInterval(2), failedWhenEnding: false),
-            .active(elapsedSeconds: 0, taskRunSeq: 1, taskIdShort: "s2-1")
+            .active(elapsedSeconds: 0, taskRunSeq: 1, sessionKey: ESP32Protocol.sessionKey(for: "s2"), taskIdShort: "s2-1")
         )
         XCTAssertEqual(
             tracker.update(displaySessionId: "s1", session: first, now: start.addingTimeInterval(4), failedWhenEnding: false),
-            .active(elapsedSeconds: 4, taskRunSeq: 1, taskIdShort: "s1-1")
+            .active(elapsedSeconds: 4, taskRunSeq: 1, sessionKey: ESP32Protocol.sessionKey(for: "s1"), taskIdShort: "s1-1")
         )
     }
 
@@ -251,7 +252,7 @@ final class AppStatePrimarySourceTests: XCTestCase {
             failedWhenEnding: false
         )
 
-        XCTAssertEqual(delayedDisplay, .active(elapsedSeconds: 5, taskRunSeq: 1, taskIdShort: "s1-1"))
+        XCTAssertEqual(delayedDisplay, .active(elapsedSeconds: 5, taskRunSeq: 1, sessionKey: ESP32Protocol.sessionKey(for: "s1"), taskIdShort: "s1-1"))
     }
 
     func testBuddyTaskRunTrackerFinalizesAndRestartsForSecondPrompt() {
@@ -264,12 +265,12 @@ final class AppStatePrimarySourceTests: XCTestCase {
 
         session.status = .idle
         let complete = tracker.update(displaySessionId: "s1", session: session, now: start.addingTimeInterval(4), failedWhenEnding: false)
-        XCTAssertEqual(complete, .completed(elapsedSeconds: 4, taskRunSeq: 1, taskIdShort: "s1-1"))
+        XCTAssertEqual(complete, .completed(elapsedSeconds: 4, taskRunSeq: 1, sessionKey: ESP32Protocol.sessionKey(for: "s1"), taskIdShort: "s1-1"))
 
         session.status = .processing
         session.userPromptSequence = 2
         let next = tracker.update(displaySessionId: "s1", session: session, now: start.addingTimeInterval(8), failedWhenEnding: false)
-        XCTAssertEqual(next, .active(elapsedSeconds: 0, taskRunSeq: 2, taskIdShort: "s1-2"))
+        XCTAssertEqual(next, .active(elapsedSeconds: 0, taskRunSeq: 2, sessionKey: ESP32Protocol.sessionKey(for: "s1"), taskIdShort: "s1-2"))
     }
 
     func testBuddyTaskRunTrackerEmitsFailedFinalFrame() {
@@ -282,6 +283,45 @@ final class AppStatePrimarySourceTests: XCTestCase {
 
         session.status = .idle
         let failed = tracker.update(displaySessionId: "s1", session: session, now: start.addingTimeInterval(2), failedWhenEnding: true)
-        XCTAssertEqual(failed, .failed(elapsedSeconds: 2, taskRunSeq: 7, taskIdShort: "s1-7"))
+        XCTAssertEqual(failed, .failed(elapsedSeconds: 2, taskRunSeq: 7, sessionKey: ESP32Protocol.sessionKey(for: "s1"), taskIdShort: "s1-7"))
+    }
+
+    func testBuddyTaskRunTrackerEmbedsDistinctSessionKeys() {
+        var tracker = BuddyTaskRunTracker()
+        let start = Date(timeIntervalSince1970: 100)
+        var first = SessionSnapshot()
+        first.status = .running
+        first.userPromptSequence = 1
+        var second = SessionSnapshot()
+        second.status = .running
+        second.userPromptSequence = 1
+
+        let a = tracker.update(displaySessionId: "session-one", session: first, now: start, failedWhenEnding: false)
+        let b = tracker.update(displaySessionId: "session-two", session: second, now: start, failedWhenEnding: false)
+
+        // Same promptSequence (1) for both, but the session key must differ so
+        // Buddy keeps them in separate slots instead of overwriting one another.
+        XCTAssertEqual(a?.taskRunSeq, b?.taskRunSeq)
+        XCTAssertNotNil(a?.sessionKey)
+        XCTAssertNotEqual(a?.sessionKey, b?.sessionKey)
+        XCTAssertEqual(a?.sessionKey, ESP32Protocol.sessionKey(for: "session-one"))
+        XCTAssertEqual(b?.sessionKey, ESP32Protocol.sessionKey(for: "session-two"))
+    }
+
+    func testBuddyTaskRunTrackerFinalClearTargetsSession() {
+        var tracker = BuddyTaskRunTracker()
+        let start = Date(timeIntervalSince1970: 100)
+        var session = SessionSnapshot()
+        session.status = .running
+        session.userPromptSequence = 1
+        _ = tracker.update(displaySessionId: "s1", session: session, now: start, failedWhenEnding: false)
+
+        session.status = .idle
+        // First idle tick emits the final completed frame.
+        _ = tracker.update(displaySessionId: "s1", session: session, now: start.addingTimeInterval(2), failedWhenEnding: false)
+        // Next tick (finalSent) emits a clear scoped to this session only.
+        let cleared = tracker.update(displaySessionId: "s1", session: session, now: start.addingTimeInterval(3), failedWhenEnding: false)
+        XCTAssertEqual(cleared, .clear(sessionKey: ESP32Protocol.sessionKey(for: "s1")))
+        XCTAssertNotEqual(cleared?.sessionKey, 0)
     }
 }

@@ -46,8 +46,12 @@ import Foundation
 ///   byte[1] = flags (bit0 active, bit1 completed, bit2 failed)
 ///   byte[2..3] = elapsedSeconds UInt16 big-endian, clamped to 0...999
 ///   byte[4..5] = taskRunSeq UInt16 big-endian
-///   byte[6] = taskIdLen (0..12)
-///   byte[7..] = taskIdShort UTF-8 (truncated to 12 bytes)
+///   byte[6..7] = sessionKey UInt16 big-endian (FNV-16 of session id; 0 = all/invalid)
+///   byte[8] = taskIdLen (0..9)
+///   byte[9..] = taskIdShort UTF-8 (truncated to 9 bytes)
+/// Buddy keeps one timer slot per sessionKey (parallel sessions). flags == 0 with
+/// sessionKey != 0 clears only that session's slot; flags == 0 with sessionKey == 0
+/// clears all slots.
 ///
 /// Uplink (button notify / notification action):
 ///   1 byte = currently displayed mascot sourceId (focus request), or
@@ -92,9 +96,21 @@ public enum ESP32Protocol {
     public static let toolHistoryFrameMarker: UInt8 = 0xF5
     public static let maxToolHistoryNameBytes = 11
     public static let taskRunFrameMarker: UInt8 = 0xEF
-    public static let maxTaskRunIdBytes = 12
-    public static let maxTaskRunFrameBytes = 7 + maxTaskRunIdBytes
+    public static let maxTaskRunIdBytes = 9
+    public static let taskRunSessionKeyBytes = 2
+    public static let maxTaskRunFrameBytes = 9 + maxTaskRunIdBytes
     public static let maxTaskRunElapsedSeconds = 999
+
+    /// Stable 16-bit key for a session id (FNV-1a, 16-bit folded). 0 is reserved for
+    /// "all/invalid", so a real session that hashes to 0 is bumped to 1.
+    public static func sessionKey(for sessionId: String) -> UInt16 {
+        var hash: UInt32 = 2166136261
+        for byte in sessionId.utf8 {
+            hash = (hash ^ UInt32(byte)) &* 16777619
+        }
+        let folded = UInt16(truncatingIfNeeded: hash) ^ UInt16(truncatingIfNeeded: hash >> 16)
+        return folded == 0 ? 1 : folded
+    }
     public static let approveCurrentPermissionMarker: UInt8 = 0xF0
     public static let denyCurrentPermissionMarker: UInt8 = 0xF1
     public static let skipCurrentQuestionMarker: UInt8 = 0xF2
@@ -538,36 +554,42 @@ public struct BuddyTaskRunPayload: Equatable, Sendable {
     public let flags: BuddyTaskRunFlags
     public let elapsedSeconds: UInt16
     public let taskRunSeq: UInt16
+    /// Stable per-session key so Buddy can keep parallel timers (0 = all/invalid).
+    public let sessionKey: UInt16
     public let taskIdShort: String?
 
     public init(
         flags: BuddyTaskRunFlags,
         elapsedSeconds: Int,
         taskRunSeq: Int,
+        sessionKey: UInt16,
         taskIdShort: String?
     ) {
         self.flags = flags
         self.elapsedSeconds = UInt16(min(max(elapsedSeconds, 0), ESP32Protocol.maxTaskRunElapsedSeconds))
         self.taskRunSeq = UInt16(min(max(taskRunSeq, 0), Int(UInt16.max)))
+        self.sessionKey = sessionKey
 
         let trimmed = taskIdShort?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.taskIdShort = trimmed?.isEmpty == false ? trimmed : nil
     }
 
-    public static func active(elapsedSeconds: Int, taskRunSeq: Int, taskIdShort: String?) -> BuddyTaskRunPayload {
-        BuddyTaskRunPayload(flags: [.active], elapsedSeconds: elapsedSeconds, taskRunSeq: taskRunSeq, taskIdShort: taskIdShort)
+    public static func active(elapsedSeconds: Int, taskRunSeq: Int, sessionKey: UInt16, taskIdShort: String?) -> BuddyTaskRunPayload {
+        BuddyTaskRunPayload(flags: [.active], elapsedSeconds: elapsedSeconds, taskRunSeq: taskRunSeq, sessionKey: sessionKey, taskIdShort: taskIdShort)
     }
 
-    public static func completed(elapsedSeconds: Int, taskRunSeq: Int, taskIdShort: String?) -> BuddyTaskRunPayload {
-        BuddyTaskRunPayload(flags: [.completed], elapsedSeconds: elapsedSeconds, taskRunSeq: taskRunSeq, taskIdShort: taskIdShort)
+    public static func completed(elapsedSeconds: Int, taskRunSeq: Int, sessionKey: UInt16, taskIdShort: String?) -> BuddyTaskRunPayload {
+        BuddyTaskRunPayload(flags: [.completed], elapsedSeconds: elapsedSeconds, taskRunSeq: taskRunSeq, sessionKey: sessionKey, taskIdShort: taskIdShort)
     }
 
-    public static func failed(elapsedSeconds: Int, taskRunSeq: Int, taskIdShort: String?) -> BuddyTaskRunPayload {
-        BuddyTaskRunPayload(flags: [.failed], elapsedSeconds: elapsedSeconds, taskRunSeq: taskRunSeq, taskIdShort: taskIdShort)
+    public static func failed(elapsedSeconds: Int, taskRunSeq: Int, sessionKey: UInt16, taskIdShort: String?) -> BuddyTaskRunPayload {
+        BuddyTaskRunPayload(flags: [.failed], elapsedSeconds: elapsedSeconds, taskRunSeq: taskRunSeq, sessionKey: sessionKey, taskIdShort: taskIdShort)
     }
 
-    public static func clear() -> BuddyTaskRunPayload {
-        BuddyTaskRunPayload(flags: [], elapsedSeconds: 0, taskRunSeq: 0, taskIdShort: nil)
+    /// Clear timer slots. `sessionKey == 0` clears every slot; a non-zero key
+    /// clears only that session's slot.
+    public static func clear(sessionKey: UInt16 = 0) -> BuddyTaskRunPayload {
+        BuddyTaskRunPayload(flags: [], elapsedSeconds: 0, taskRunSeq: 0, sessionKey: sessionKey, taskIdShort: nil)
     }
 
     public func encode() -> Data {
@@ -579,6 +601,8 @@ public struct BuddyTaskRunPayload: Equatable, Sendable {
         data.append(UInt8(elapsedSeconds & 0xFF))
         data.append(UInt8(taskRunSeq >> 8))
         data.append(UInt8(taskRunSeq & 0xFF))
+        data.append(UInt8(sessionKey >> 8))
+        data.append(UInt8(sessionKey & 0xFF))
 
         let idBytes = Array((taskIdShort ?? "").utf8.prefix(ESP32Protocol.maxTaskRunIdBytes))
         data.append(UInt8(idBytes.count))

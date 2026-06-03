@@ -241,50 +241,74 @@ final class ESP32ProtocolTests: XCTestCase {
     // MARK: - Task run frame encoding
 
     func testEncodeTaskRunActiveFrame() {
-        let frame = BuddyTaskRunPayload.active(elapsedSeconds: 18, taskRunSeq: 42, taskIdShort: "s1-42")
+        let frame = BuddyTaskRunPayload.active(elapsedSeconds: 18, taskRunSeq: 42, sessionKey: 0xABCD, taskIdShort: "s1-42")
         let data = frame.encode()
 
         XCTAssertEqual(data[0], ESP32Protocol.taskRunFrameMarker)
         XCTAssertEqual(data[1], BuddyTaskRunFlags.active.rawValue)
         XCTAssertEqual(UInt16(data[2]) << 8 | UInt16(data[3]), 18)
         XCTAssertEqual(UInt16(data[4]) << 8 | UInt16(data[5]), 42)
-        XCTAssertEqual(data[6], 5)
-        XCTAssertEqual(String(data: data.subdata(in: 7..<data.count), encoding: .utf8), "s1-42")
+        XCTAssertEqual(UInt16(data[6]) << 8 | UInt16(data[7]), 0xABCD)
+        XCTAssertEqual(data[8], 5)
+        XCTAssertEqual(String(data: data.subdata(in: 9..<data.count), encoding: .utf8), "s1-42")
         XCTAssertLessThanOrEqual(data.count, ESP32Protocol.maxTaskRunFrameBytes)
+    }
+
+    func testEncodeTaskRunFrameCarriesSessionKey() {
+        let frame = BuddyTaskRunPayload.active(elapsedSeconds: 1, taskRunSeq: 1, sessionKey: 0x1234, taskIdShort: nil)
+        let data = frame.encode()
+        XCTAssertEqual(UInt16(data[6]) << 8 | UInt16(data[7]), 0x1234)
     }
 
     func testEncodeTaskRunFinalFlags() {
         XCTAssertEqual(
-            BuddyTaskRunPayload.completed(elapsedSeconds: 3, taskRunSeq: 1, taskIdShort: nil).encode()[1],
+            BuddyTaskRunPayload.completed(elapsedSeconds: 3, taskRunSeq: 1, sessionKey: 1, taskIdShort: nil).encode()[1],
             BuddyTaskRunFlags.completed.rawValue
         )
         XCTAssertEqual(
-            BuddyTaskRunPayload.failed(elapsedSeconds: 4, taskRunSeq: 2, taskIdShort: nil).encode()[1],
+            BuddyTaskRunPayload.failed(elapsedSeconds: 4, taskRunSeq: 2, sessionKey: 1, taskIdShort: nil).encode()[1],
             BuddyTaskRunFlags.failed.rawValue
         )
     }
 
-    func testEncodeTaskRunClearFrame() {
+    func testEncodeTaskRunClearAllFrame() {
         XCTAssertEqual(
             Array(BuddyTaskRunPayload.clear().encode()),
-            [ESP32Protocol.taskRunFrameMarker, 0, 0, 0, 0, 0, 0]
+            [ESP32Protocol.taskRunFrameMarker, 0, 0, 0, 0, 0, 0, 0, 0]
         )
     }
 
+    func testEncodeTaskRunClearSingleSessionFrame() {
+        let data = BuddyTaskRunPayload.clear(sessionKey: 0x00FF).encode()
+        XCTAssertEqual(data[1], 0) // no flags = clear
+        XCTAssertEqual(UInt16(data[6]) << 8 | UInt16(data[7]), 0x00FF)
+        XCTAssertEqual(data[8], 0) // empty id
+    }
+
     func testTaskRunElapsedClampsTo999() {
-        let frame = BuddyTaskRunPayload.active(elapsedSeconds: 1200, taskRunSeq: 7, taskIdShort: nil)
+        let frame = BuddyTaskRunPayload.active(elapsedSeconds: 1200, taskRunSeq: 7, sessionKey: 1, taskIdShort: nil)
         XCTAssertEqual(frame.elapsedSeconds, 999)
         let data = frame.encode()
         XCTAssertEqual(UInt16(data[2]) << 8 | UInt16(data[3]), 999)
     }
 
-    func testTaskRunIdTruncatesToTwelveBytes() {
-        let frame = BuddyTaskRunPayload.active(elapsedSeconds: 1, taskRunSeq: 1, taskIdShort: "abcdefghijklmnop")
+    func testTaskRunIdTruncatesToNineBytes() {
+        let frame = BuddyTaskRunPayload.active(elapsedSeconds: 1, taskRunSeq: 1, sessionKey: 1, taskIdShort: "abcdefghijklmnop")
         let data = frame.encode()
 
-        XCTAssertEqual(data[6], UInt8(ESP32Protocol.maxTaskRunIdBytes))
+        XCTAssertEqual(data[8], UInt8(ESP32Protocol.maxTaskRunIdBytes))
         XCTAssertEqual(data.count, ESP32Protocol.maxTaskRunFrameBytes)
-        XCTAssertEqual(String(data: data.subdata(in: 7..<data.count), encoding: .utf8), "abcdefghijkl")
+        XCTAssertEqual(String(data: data.subdata(in: 9..<data.count), encoding: .utf8), "abcdefghi")
+    }
+
+    func testSessionKeyStableAndNonZero() {
+        let a = ESP32Protocol.sessionKey(for: "session-alpha")
+        let b = ESP32Protocol.sessionKey(for: "session-alpha")
+        let c = ESP32Protocol.sessionKey(for: "session-bravo")
+        XCTAssertEqual(a, b)            // stable
+        XCTAssertNotEqual(a, 0)         // reserved value avoided
+        XCTAssertNotEqual(c, 0)
+        XCTAssertNotEqual(a, c)         // distinct sessions differ
     }
 
     // MARK: - Tool history frame encoding

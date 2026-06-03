@@ -75,6 +75,7 @@ extension BuddyTaskRunTracker {
         let promptSequence = session.userPromptSequence
         let isActiveStatus = Self.isTaskActiveStatus(session.status)
         let key = RunKey(sessionId: displaySessionId, promptSequence: promptSequence)
+        let sessionKey = ESP32Protocol.sessionKey(for: displaySessionId)
 
         if isActiveStatus && promptSequence > 0 {
             if runs[key] == nil {
@@ -91,13 +92,13 @@ extension BuddyTaskRunTracker {
             }
             run.lastSentElapsed = elapsed
             runs[key] = run
-            return .active(elapsedSeconds: Int(elapsed), taskRunSeq: Int(key.promptSequence), taskIdShort: run.taskIdShort)
+            return .active(elapsedSeconds: Int(elapsed), taskRunSeq: Int(key.promptSequence), sessionKey: sessionKey, taskIdShort: run.taskIdShort)
         }
 
         guard var run = runs[key] else { return nil }
         guard !run.finalSent else {
             runs.removeValue(forKey: key)
-            return .clear()
+            return .clear(sessionKey: sessionKey)
         }
 
         let elapsed = Self.elapsedSeconds(startedAt: run.startedAt, now: now)
@@ -105,8 +106,8 @@ extension BuddyTaskRunTracker {
         runs[key] = run
 
         if failedWhenEnding {
-            return .failed(elapsedSeconds: elapsed, taskRunSeq: Int(key.promptSequence), taskIdShort: run.taskIdShort)
+            return .failed(elapsedSeconds: elapsed, taskRunSeq: Int(key.promptSequence), sessionKey: sessionKey, taskIdShort: run.taskIdShort)
         }
-        return .completed(elapsedSeconds: elapsed, taskRunSeq: Int(key.promptSequence), taskIdShort: run.taskIdShort)
+        return .completed(elapsedSeconds: elapsed, taskRunSeq: Int(key.promptSequence), sessionKey: sessionKey, taskIdShort: run.taskIdShort)
     }
 }

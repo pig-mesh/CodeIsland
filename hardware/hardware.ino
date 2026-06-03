@@ -78,7 +78,8 @@ static char bleDeviceName[BLE_DEVICE_NAME_LEN] = "Buddy";
 #define BUDDY_SCREEN_UP                 0
 #define BUDDY_SCREEN_DOWN               1
 #define BUDDY_TASK_RUN_FRAME            0xEF
-#define BUDDY_TASK_ID_MAX               12
+#define BUDDY_TASK_ID_MAX               9
+#define BUDDY_TASK_RUN_SLOTS            4
 
 // --- Pairing protocol ---
 #define PAIR_REQUEST_MARKER    0xE0
@@ -138,12 +139,23 @@ volatile uint16_t bleConnId = 0;
 volatile bool     bleConnIdValid = false;
 volatile unsigned long lastBleData = 0;
 volatile unsigned long lastWakeActivity = 0;
-volatile bool     taskRunActive = false;
-volatile bool     taskRunCompleted = false;
-volatile bool     taskRunFailed = false;
-volatile uint16_t taskRunElapsedSeconds = 0;
-volatile uint16_t taskRunSeq = 0;
-char              taskRunIdShort[BUDDY_TASK_ID_MAX + 1] = {0};
+// One timer slot per session, so parallel sessions (轮播) don't overwrite each
+// other. Mac sends the authoritative baseElapsed; the board free-runs from there
+// using millis() between calibration frames. Guarded by bleMux like all BLE state.
+struct TaskRunSlot {
+  bool     used = false;
+  bool     active = false;
+  bool     completed = false;
+  bool     failed = false;
+  uint16_t sessionKey = 0;
+  uint16_t seq = 0;
+  uint16_t baseElapsed = 0;        // 上次 Mac 校准的已用秒数
+  unsigned long baseMillis = 0;    // 收到该帧时的本地 millis()
+  unsigned long lastUpdate = 0;    // LRU 淘汰依据
+  char     id[BUDDY_TASK_ID_MAX + 1] = {0};
+};
+TaskRunSlot       taskRunSlots[BUDDY_TASK_RUN_SLOTS];
+uint16_t          taskRunDisplayKey = 0;  // 当前应显示的 session（最近收到帧者）
 volatile uint8_t  buddyBrightnessPercent = BUDDY_BRIGHTNESS_DEFAULT_PERCENT;
 volatile uint8_t  buddyScreenOrientation = BUDDY_SCREEN_UP;
 volatile bool     buddyOrientationDirty = false;
@@ -342,26 +354,55 @@ bool statusKeepsScreenAwake(uint8_t status) {
   return status == 1 || status == 2 || status == 3 || status == 4;
 }
 
-bool statusShowsTaskRun(uint8_t status) {
-  return status == 1 || status == 2 || status == 3 || status == 4;
-}
+// --- Task-run slot management (call with bleMux held) ---
 
-void clearTaskRunLocked() {
-  taskRunActive = false;
-  taskRunCompleted = false;
-  taskRunFailed = false;
-  taskRunElapsedSeconds = 0;
-  taskRunSeq = 0;
-  taskRunIdShort[0] = '\0';
-}
-
-void copyTaskRunIdLocked(const uint8_t* src, uint8_t len) {
-  if (len > BUDDY_TASK_ID_MAX) len = BUDDY_TASK_ID_MAX;
-  memset(taskRunIdShort, 0, sizeof(taskRunIdShort));
-  if (src != nullptr && len > 0) {
-    memcpy(taskRunIdShort, src, len);
+void clearAllTaskRunSlotsLocked() {
+  for (int i = 0; i < BUDDY_TASK_RUN_SLOTS; i++) {
+    taskRunSlots[i] = TaskRunSlot();
   }
-  taskRunIdShort[len] = '\0';
+  taskRunDisplayKey = 0;
+}
+
+bool anyTaskRunSlotUsedLocked() {
+  for (int i = 0; i < BUDDY_TASK_RUN_SLOTS; i++) {
+    if (taskRunSlots[i].used) return true;
+  }
+  return false;
+}
+
+int findTaskRunSlotLocked(uint16_t key) {
+  for (int i = 0; i < BUDDY_TASK_RUN_SLOTS; i++) {
+    if (taskRunSlots[i].used && taskRunSlots[i].sessionKey == key) return i;
+  }
+  return -1;
+}
+
+// Locate an existing slot for `key`, else a free slot, else evict the
+// least-recently-updated slot (LRU).
+int allocTaskRunSlotLocked(uint16_t key) {
+  int existing = findTaskRunSlotLocked(key);
+  if (existing >= 0) return existing;
+  int lru = 0;
+  for (int i = 0; i < BUDDY_TASK_RUN_SLOTS; i++) {
+    if (!taskRunSlots[i].used) return i;
+    if (taskRunSlots[i].lastUpdate < taskRunSlots[lru].lastUpdate) lru = i;
+  }
+  return lru;
+}
+
+void clearTaskRunSlotByKeyLocked(uint16_t key) {
+  int idx = findTaskRunSlotLocked(key);
+  if (idx >= 0) taskRunSlots[idx] = TaskRunSlot();
+  if (taskRunDisplayKey == key) taskRunDisplayKey = 0;
+}
+
+void copyTaskRunIdLocked(TaskRunSlot& slot, const uint8_t* src, uint8_t len) {
+  if (len > BUDDY_TASK_ID_MAX) len = BUDDY_TASK_ID_MAX;
+  memset(slot.id, 0, sizeof(slot.id));
+  if (src != nullptr && len > 0) {
+    memcpy(slot.id, src, len);
+  }
+  slot.id[len] = '\0';
 }
 
 uint8_t clampBuddyBrightness(uint8_t percent) {
@@ -768,8 +809,9 @@ class CharCallbacks : public BLECharacteristicCallbacks {
     }
 
     // Task Run frame (0xEF): marker, flags, elapsed u16, seq u16, idLen, id bytes
+    // Task Run frame (0xEF): marker, flags, elapsed u16, seq u16, sessionKey u16, idLen, id bytes
     if (len >= 1 && data[0] == BUDDY_TASK_RUN_FRAME) {
-      if (len < 7) {
+      if (len < 9) {
         Serial.println("[BLE] WARN: task-run frame too short, ignored");
         return;
       }
@@ -778,26 +820,42 @@ class CharCallbacks : public BLECharacteristicCallbacks {
       uint16_t elapsed = ((uint16_t)data[2] << 8) | data[3];
       if (elapsed > 999) elapsed = 999;
       uint16_t seq = ((uint16_t)data[4] << 8) | data[5];
-      uint8_t idLen = data[6];
-      uint8_t available = (len > 7) ? (uint8_t)(len - 7) : 0;
+      uint16_t sessionKey = ((uint16_t)data[6] << 8) | data[7];
+      uint8_t idLen = data[8];
+      uint8_t available = (len > 9) ? (uint8_t)(len - 9) : 0;
       if (idLen > available) idLen = available;
       if (idLen > BUDDY_TASK_ID_MAX) idLen = BUDDY_TASK_ID_MAX;
 
-      char localTaskRunId[BUDDY_TASK_ID_MAX + 1];
+      bool isClear = (flags & 0x07) == 0;
+      char localTaskRunId[BUDDY_TASK_ID_MAX + 1] = {0};
+      unsigned long now_taskrun = millis();
       portENTER_CRITICAL(&bleMux);
-      taskRunActive = (flags & 0x01) != 0;
-      taskRunCompleted = (flags & 0x02) != 0;
-      taskRunFailed = (flags & 0x04) != 0;
-      taskRunElapsedSeconds = elapsed;
-      taskRunSeq = seq;
-      copyTaskRunIdLocked(idLen > 0 ? data + 7 : nullptr, idLen);
-      lastBleData = millis();
-      memcpy(localTaskRunId, taskRunIdShort, sizeof(localTaskRunId));
+      if (isClear) {
+        // sessionKey 0 = clear all; non-zero = clear only that session's slot.
+        if (sessionKey == 0) clearAllTaskRunSlotsLocked();
+        else clearTaskRunSlotByKeyLocked(sessionKey);
+      } else {
+        int idx = allocTaskRunSlotLocked(sessionKey);
+        TaskRunSlot& slot = taskRunSlots[idx];
+        slot.used = true;
+        slot.active = (flags & 0x01) != 0;
+        slot.completed = (flags & 0x02) != 0;
+        slot.failed = (flags & 0x04) != 0;
+        slot.sessionKey = sessionKey;
+        slot.seq = seq;
+        slot.baseElapsed = elapsed;
+        slot.baseMillis = now_taskrun;
+        slot.lastUpdate = now_taskrun;
+        copyTaskRunIdLocked(slot, idLen > 0 ? data + 9 : nullptr, idLen);
+        memcpy(localTaskRunId, slot.id, sizeof(localTaskRunId));
+        taskRunDisplayKey = sessionKey;  // 跟随 Mac 的 display/轮播
+      }
+      lastBleData = now_taskrun;
       portEXIT_CRITICAL(&bleMux);
 
       infoDirty = true;
-      Serial.printf("[BLE] TaskRun: flags=0x%02X elapsed=%us seq=%u id=\"%s\"\n",
-        flags, elapsed, seq, localTaskRunId);
+      Serial.printf("[BLE] TaskRun: flags=0x%02X elapsed=%us seq=%u key=%u id=\"%s\"\n",
+        flags, elapsed, seq, sessionKey, localTaskRunId);
       return;
     }
 
@@ -900,9 +958,9 @@ class CharCallbacks : public BLECharacteristicCallbacks {
     portENTER_CRITICAL(&bleMux);
     if (bleSourceId != nextSourceId) headerDirty = true;
     if (bleStatusId != nextStatusId) infoDirty = true;
-    if (!statusShowsTaskRun(nextStatusId)) {
-      clearTaskRunLocked();
-    }
+    // Task-run slots are driven solely by 0xEF frames (which carry the sessionKey).
+    // The status frame has no sessionKey, so clearing here would wipe the wrong
+    // session; Mac sends a per-session clear/completed frame when a run ends.
     bleSourceId = nextSourceId;
     bleStatusId = nextStatusId;
     if (statusKeepsScreenAwake(bleStatusId)) {
@@ -1010,15 +1068,28 @@ void formatTaskElapsed(char* buf, size_t bufSize, unsigned long elapsedSeconds) 
 }
 
 void drawTaskRunTimer(AgentLampState state) {
-  bool localActive;
-  bool localCompleted;
-  bool localFailed;
-  uint16_t localElapsed;
+  bool localActive = false;
+  bool localCompleted = false;
+  bool localFailed = false;
+  uint16_t localElapsed = 0;
+  unsigned long now_draw = millis();
   portENTER_CRITICAL(&bleMux);
-  localActive = taskRunActive;
-  localCompleted = taskRunCompleted;
-  localFailed = taskRunFailed;
-  localElapsed = taskRunElapsedSeconds;
+  int idx = findTaskRunSlotLocked(taskRunDisplayKey);
+  if (idx >= 0) {
+    TaskRunSlot& slot = taskRunSlots[idx];
+    localActive = slot.active;
+    localCompleted = slot.completed;
+    localFailed = slot.failed;
+    if (slot.active) {
+      // Free-run from the last Mac calibration so the seconds keep ticking
+      // smoothly between frames (and immediately on 轮播 switch-back).
+      unsigned long extra = (now_draw >= slot.baseMillis) ? (now_draw - slot.baseMillis) / 1000UL : 0;
+      unsigned long shown = (unsigned long)slot.baseElapsed + extra;
+      localElapsed = (shown > 999) ? 999 : (uint16_t)shown;
+    } else {
+      localElapsed = slot.baseElapsed;  // completed/failed 定格
+    }
+  }
   portEXIT_CRITICAL(&bleMux);
   if (!localActive && !localCompleted && !localFailed) return;
 
@@ -1631,11 +1702,11 @@ void loop() {
   if (appMode == MODE_AGENT && (now - lastBleData) > BLE_TIMEOUT_MS) {
     bool clearedStaleAgentState = false;
     portENTER_CRITICAL(&bleMux);
-    if (bleStatusId != 0 || bleToolName[0] != '\0' || pendingAnim != ANIM_NONE || taskRunActive || taskRunCompleted || taskRunFailed) {
+    if (bleStatusId != 0 || bleToolName[0] != '\0' || pendingAnim != ANIM_NONE || anyTaskRunSlotUsedLocked()) {
       bleStatusId = 0;
       bleToolName[0] = '\0';
       pendingAnim = ANIM_NONE;
-      clearTaskRunLocked();
+      clearAllTaskRunSlotsLocked();
       infoDirty = true;
       clearedStaleAgentState = true;
     }
