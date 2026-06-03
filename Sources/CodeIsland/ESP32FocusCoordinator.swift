@@ -1,4 +1,3 @@
-import AppKit
 import Foundation
 import os
 import CodeIslandCore
@@ -7,10 +6,10 @@ import CodeIslandCore
 /// "focus that agent's terminal/window" action.
 ///
 /// This keeps focus routing aligned with the mascot currently shown on Buddy.
-/// We pick the best session belonging to the requested mascot (preferring
-/// ones with pending work) and hand it to `TerminalActivator`, whose tab-level
-/// matchers already know how to land inside the exact iTerm2 session / Ghostty
-/// tab / Kitty window / tmux pane / Cursor project window / etc.
+/// We pick the best active session belonging to the requested mascot and hand
+/// it to `TerminalActivator`, whose tab-level matchers already know how to land
+/// inside the exact iTerm2 session / Ghostty tab / Kitty window / tmux pane /
+/// Cursor project window / etc.
 @MainActor
 enum ESP32FocusCoordinator {
     private static let log = Logger(subsystem: "com.codeisland", category: "esp32-focus")
@@ -24,36 +23,34 @@ enum ESP32FocusCoordinator {
         case .waitingQuestion: return 4
         case .running:         return 3
         case .processing:      return 2
-        case .idle:            return 1
+        case .idle:            return 0
         }
     }
 
-    static func handle(mascot: MascotID, appState: AppState) {
+    static func targetSession(for mascot: MascotID, appState: AppState) -> (sessionId: String, session: SessionSnapshot)? {
         let targetSource = mascot.sourceName
 
-        let candidates = appState.sessions
-            .filter { $0.value.source == targetSource }
+        return appState.sessions
+            .filter { $0.value.source == targetSource && $0.value.status != .idle }
             .sorted { a, b in
                 let pa = priority(a.value.status)
                 let pb = priority(b.value.status)
                 if pa != pb { return pa > pb }
                 return a.value.lastActivity > b.value.lastActivity
             }
+            .first
+            .map { (sessionId: $0.key, session: $0.value) }
+    }
 
-        if let (sessionId, session) = candidates.first {
+    static func handle(mascot: MascotID, appState: AppState) {
+        let targetSource = mascot.sourceName
+
+        if let (sessionId, session) = targetSession(for: mascot, appState: appState) {
             log.info("Focus \(targetSource): session=\(sessionId) status=\(String(describing: session.status))")
             TerminalActivator.activate(session: session, sessionId: sessionId)
             return
         }
 
-        if let bundleId = TerminalActivator.sourceToNativeAppBundleId[targetSource],
-           let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleId }) {
-            log.info("Focus \(targetSource): no session, activating desktop app \(bundleId)")
-            if app.isHidden { app.unhide() }
-            app.activate()
-            return
-        }
-
-        log.info("Focus \(targetSource): no active session, no desktop app running — ignored")
+        log.info("Focus \(targetSource): no active session — ignored")
     }
 }
