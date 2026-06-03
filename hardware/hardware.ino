@@ -77,6 +77,8 @@ static char bleDeviceName[BLE_DEVICE_NAME_LEN] = "Buddy";
 #define BUDDY_BRIGHTNESS_DEFAULT_PERCENT 70
 #define BUDDY_SCREEN_UP                 0
 #define BUDDY_SCREEN_DOWN               1
+#define BUDDY_TASK_RUN_FRAME            0xEF
+#define BUDDY_TASK_ID_MAX               12
 
 // --- Pairing protocol ---
 #define PAIR_REQUEST_MARKER    0xE0
@@ -136,9 +138,12 @@ volatile uint16_t bleConnId = 0;
 volatile bool     bleConnIdValid = false;
 volatile unsigned long lastBleData = 0;
 volatile unsigned long lastWakeActivity = 0;
-volatile bool     taskTimerActive = false;
-volatile unsigned long taskTimerStart = 0;
-volatile uint8_t  taskTimerSourceId = 0xFF;
+volatile bool     taskRunActive = false;
+volatile bool     taskRunCompleted = false;
+volatile bool     taskRunFailed = false;
+volatile uint16_t taskRunElapsedSeconds = 0;
+volatile uint16_t taskRunSeq = 0;
+char              taskRunIdShort[BUDDY_TASK_ID_MAX + 1] = {0};
 volatile uint8_t  buddyBrightnessPercent = BUDDY_BRIGHTNESS_DEFAULT_PERCENT;
 volatile uint8_t  buddyScreenOrientation = BUDDY_SCREEN_UP;
 volatile bool     buddyOrientationDirty = false;
@@ -337,8 +342,26 @@ bool statusKeepsScreenAwake(uint8_t status) {
   return status == 1 || status == 2 || status == 3 || status == 4;
 }
 
-bool statusHasTaskTimer(uint8_t status) {
+bool statusShowsTaskRun(uint8_t status) {
   return status == 1 || status == 2 || status == 3 || status == 4;
+}
+
+void clearTaskRunLocked() {
+  taskRunActive = false;
+  taskRunCompleted = false;
+  taskRunFailed = false;
+  taskRunElapsedSeconds = 0;
+  taskRunSeq = 0;
+  taskRunIdShort[0] = '\0';
+}
+
+void copyTaskRunIdLocked(const uint8_t* src, uint8_t len) {
+  if (len > BUDDY_TASK_ID_MAX) len = BUDDY_TASK_ID_MAX;
+  memset(taskRunIdShort, 0, sizeof(taskRunIdShort));
+  if (src != nullptr && len > 0) {
+    memcpy(taskRunIdShort, src, len);
+  }
+  taskRunIdShort[len] = '\0';
 }
 
 uint8_t clampBuddyBrightness(uint8_t percent) {
@@ -643,16 +666,19 @@ class CharCallbacks : public BLECharacteristicCallbacks {
     if (len >= 2 && data[0] == 0xFC) {
       uint8_t wsLen = data[1];
       if (wsLen > 18) wsLen = 18;
+      char nextWorkspaceName[20] = {0};
+      if (wsLen > 0 && len >= 2u + wsLen) {
+        memcpy(nextWorkspaceName, data + 2, wsLen);
+      }
+      nextWorkspaceName[wsLen] = '\0';
+      unsigned long now_workspace = millis();
       portENTER_CRITICAL(&bleMux);
       memset(bleWorkspaceName, 0, sizeof(bleWorkspaceName));
-      if (wsLen > 0 && len >= 2u + wsLen) {
-        memcpy(bleWorkspaceName, data + 2, wsLen);
-      }
-      bleWorkspaceName[wsLen] = '\0';
-      lastBleData = millis();
+      memcpy(bleWorkspaceName, nextWorkspaceName, sizeof(bleWorkspaceName) - 1);
+      lastBleData = now_workspace;
       portEXIT_CRITICAL(&bleMux);
       infoDirty = true;
-      Serial.printf("[BLE] Workspace: \"%s\"\n", bleWorkspaceName);
+      Serial.printf("[BLE] Workspace: \"%s\"\n", nextWorkspaceName);
       return;
     }
 
@@ -738,6 +764,40 @@ class CharCallbacks : public BLECharacteristicCallbacks {
       loggedHour = bleCurrentHour;
       portEXIT_CRITICAL(&bleMux);
       Serial.printf("[BLE] Hour: %d\n", loggedHour);
+      return;
+    }
+
+    // Task Run frame (0xEF): marker, flags, elapsed u16, seq u16, idLen, id bytes
+    if (len >= 1 && data[0] == BUDDY_TASK_RUN_FRAME) {
+      if (len < 7) {
+        Serial.println("[BLE] WARN: task-run frame too short, ignored");
+        return;
+      }
+
+      uint8_t flags = data[1];
+      uint16_t elapsed = ((uint16_t)data[2] << 8) | data[3];
+      if (elapsed > 999) elapsed = 999;
+      uint16_t seq = ((uint16_t)data[4] << 8) | data[5];
+      uint8_t idLen = data[6];
+      uint8_t available = (len > 7) ? (uint8_t)(len - 7) : 0;
+      if (idLen > available) idLen = available;
+      if (idLen > BUDDY_TASK_ID_MAX) idLen = BUDDY_TASK_ID_MAX;
+
+      char localTaskRunId[BUDDY_TASK_ID_MAX + 1];
+      portENTER_CRITICAL(&bleMux);
+      taskRunActive = (flags & 0x01) != 0;
+      taskRunCompleted = (flags & 0x02) != 0;
+      taskRunFailed = (flags & 0x04) != 0;
+      taskRunElapsedSeconds = elapsed;
+      taskRunSeq = seq;
+      copyTaskRunIdLocked(idLen > 0 ? data + 7 : nullptr, idLen);
+      lastBleData = millis();
+      memcpy(localTaskRunId, taskRunIdShort, sizeof(localTaskRunId));
+      portEXIT_CRITICAL(&bleMux);
+
+      infoDirty = true;
+      Serial.printf("[BLE] TaskRun: flags=0x%02X elapsed=%us seq=%u id=\"%s\"\n",
+        flags, elapsed, seq, localTaskRunId);
       return;
     }
 
@@ -829,33 +889,27 @@ class CharCallbacks : public BLECharacteristicCallbacks {
     unsigned long now_write = millis();
     uint8_t nextSourceId = data[0];
     uint8_t nextStatusId = data[1];
+    uint8_t toolLen = data[2];
+    if (toolLen > 17) toolLen = 17;
+    char nextToolName[18] = {0};
+    if (toolLen > 0 && len >= 3u + toolLen) {
+      memcpy(nextToolName, data + 3, toolLen);
+    }
+    nextToolName[toolLen] = '\0';
 
     portENTER_CRITICAL(&bleMux);
     if (bleSourceId != nextSourceId) headerDirty = true;
     if (bleStatusId != nextStatusId) infoDirty = true;
-    if (statusHasTaskTimer(nextStatusId)) {
-      if (!taskTimerActive || taskTimerSourceId != nextSourceId) {
-        taskTimerActive = true;
-        taskTimerStart = now_write;
-        taskTimerSourceId = nextSourceId;
-      }
-    } else {
-      taskTimerActive = false;
-      taskTimerStart = 0;
-      taskTimerSourceId = 0xFF;
+    if (!statusShowsTaskRun(nextStatusId)) {
+      clearTaskRunLocked();
     }
     bleSourceId = nextSourceId;
     bleStatusId = nextStatusId;
     if (statusKeepsScreenAwake(bleStatusId)) {
       lastWakeActivity = now_write;
     }
-    uint8_t toolLen = data[2];
-    if (toolLen > 17) toolLen = 17;
     memset(bleToolName, 0, sizeof(bleToolName));
-    if (toolLen > 0 && len >= 3u + toolLen) {
-      memcpy(bleToolName, data + 3, toolLen);
-    }
-    bleToolName[toolLen] = '\0';
+    memcpy(bleToolName, nextToolName, sizeof(bleToolName) - 1);
     lastBleData = now_write;
     appMode = MODE_AGENT;
     if (lastBleWriteTime > 0) {
@@ -955,17 +1009,21 @@ void formatTaskElapsed(char* buf, size_t bufSize, unsigned long elapsedSeconds) 
   snprintf(buf, bufSize, "%lu", elapsedSeconds);
 }
 
-void drawTaskTimer(unsigned long now, AgentLampState state) {
-  bool localTimerActive;
-  unsigned long localTaskStart;
+void drawTaskRunTimer(AgentLampState state) {
+  bool localActive;
+  bool localCompleted;
+  bool localFailed;
+  uint16_t localElapsed;
   portENTER_CRITICAL(&bleMux);
-  localTimerActive = taskTimerActive;
-  localTaskStart = taskTimerStart;
+  localActive = taskRunActive;
+  localCompleted = taskRunCompleted;
+  localFailed = taskRunFailed;
+  localElapsed = taskRunElapsedSeconds;
   portEXIT_CRITICAL(&bleMux);
-  if (!localTimerActive || localTaskStart == 0 || now < localTaskStart) return;
+  if (!localActive && !localCompleted && !localFailed) return;
 
   char timeBuf[10];
-  formatTaskElapsed(timeBuf, sizeof(timeBuf), (now - localTaskStart) / 1000);
+  formatTaskElapsed(timeBuf, sizeof(timeBuf), localElapsed);
 
   const uint8_t textSize = 5;
   int16_t tw = strlen(timeBuf) * 6 * textSize;
@@ -975,7 +1033,10 @@ void drawTaskTimer(unsigned long now, AgentLampState state) {
 
   uint16_t shadowColor = RGB565(248, 252, 245);
   uint16_t textColor = RGB565(0, 18, 8);
-  if (state == LAMP_WAIT) {
+  if (localFailed) {
+    shadowColor = RGB565(28, 0, 4);
+    textColor = RGB565(255, 245, 245);
+  } else if (state == LAMP_WAIT) {
     shadowColor = RGB565(255, 248, 190);
     textColor = RGB565(42, 28, 0);
   } else if (state == LAMP_ERROR) {
@@ -1570,13 +1631,11 @@ void loop() {
   if (appMode == MODE_AGENT && (now - lastBleData) > BLE_TIMEOUT_MS) {
     bool clearedStaleAgentState = false;
     portENTER_CRITICAL(&bleMux);
-    if (bleStatusId != 0 || bleToolName[0] != '\0' || pendingAnim != ANIM_NONE) {
+    if (bleStatusId != 0 || bleToolName[0] != '\0' || pendingAnim != ANIM_NONE || taskRunActive || taskRunCompleted || taskRunFailed) {
       bleStatusId = 0;
       bleToolName[0] = '\0';
       pendingAnim = ANIM_NONE;
-      taskTimerActive = false;
-      taskTimerStart = 0;
-      taskTimerSourceId = 0xFF;
+      clearTaskRunLocked();
       infoDirty = true;
       clearedStaleAgentState = true;
     }
@@ -1677,7 +1736,7 @@ void loop() {
     drawStatusBar();
     drawMascotName(drawIdx);
     if (lampOnlyScene) {
-      drawTaskTimer(now, lampState);
+      drawTaskRunTimer(lampState);
     }
 
     // Mascot animation area (y=16..220)

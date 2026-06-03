@@ -238,6 +238,55 @@ final class ESP32ProtocolTests: XCTestCase {
         XCTAssertEqual(BuddyTimeHintPayload(hour: -1).hour, 0)
     }
 
+    // MARK: - Task run frame encoding
+
+    func testEncodeTaskRunActiveFrame() {
+        let frame = BuddyTaskRunPayload.active(elapsedSeconds: 18, taskRunSeq: 42, taskIdShort: "s1-42")
+        let data = frame.encode()
+
+        XCTAssertEqual(data[0], ESP32Protocol.taskRunFrameMarker)
+        XCTAssertEqual(data[1], BuddyTaskRunFlags.active.rawValue)
+        XCTAssertEqual(UInt16(data[2]) << 8 | UInt16(data[3]), 18)
+        XCTAssertEqual(UInt16(data[4]) << 8 | UInt16(data[5]), 42)
+        XCTAssertEqual(data[6], 5)
+        XCTAssertEqual(String(data: data.subdata(in: 7..<data.count), encoding: .utf8), "s1-42")
+        XCTAssertLessThanOrEqual(data.count, ESP32Protocol.maxTaskRunFrameBytes)
+    }
+
+    func testEncodeTaskRunFinalFlags() {
+        XCTAssertEqual(
+            BuddyTaskRunPayload.completed(elapsedSeconds: 3, taskRunSeq: 1, taskIdShort: nil).encode()[1],
+            BuddyTaskRunFlags.completed.rawValue
+        )
+        XCTAssertEqual(
+            BuddyTaskRunPayload.failed(elapsedSeconds: 4, taskRunSeq: 2, taskIdShort: nil).encode()[1],
+            BuddyTaskRunFlags.failed.rawValue
+        )
+    }
+
+    func testEncodeTaskRunClearFrame() {
+        XCTAssertEqual(
+            Array(BuddyTaskRunPayload.clear().encode()),
+            [ESP32Protocol.taskRunFrameMarker, 0, 0, 0, 0, 0, 0]
+        )
+    }
+
+    func testTaskRunElapsedClampsTo999() {
+        let frame = BuddyTaskRunPayload.active(elapsedSeconds: 1200, taskRunSeq: 7, taskIdShort: nil)
+        XCTAssertEqual(frame.elapsedSeconds, 999)
+        let data = frame.encode()
+        XCTAssertEqual(UInt16(data[2]) << 8 | UInt16(data[3]), 999)
+    }
+
+    func testTaskRunIdTruncatesToTwelveBytes() {
+        let frame = BuddyTaskRunPayload.active(elapsedSeconds: 1, taskRunSeq: 1, taskIdShort: "abcdefghijklmnop")
+        let data = frame.encode()
+
+        XCTAssertEqual(data[6], UInt8(ESP32Protocol.maxTaskRunIdBytes))
+        XCTAssertEqual(data.count, ESP32Protocol.maxTaskRunFrameBytes)
+        XCTAssertEqual(String(data: data.subdata(in: 7..<data.count), encoding: .utf8), "abcdefghijkl")
+    }
+
     // MARK: - Tool history frame encoding
 
     func testEncodeToolHistoryFrame() {

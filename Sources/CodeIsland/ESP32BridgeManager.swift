@@ -377,6 +377,11 @@ final class ESP32BridgeManager: NSObject {
         send(timeHint.encode(), priority: .auxiliary)
     }
 
+    /// Write task-run elapsed timer frame to Buddy. No-op when not connected.
+    func sendTaskRun(_ taskRun: BuddyTaskRunPayload) {
+        send(taskRun.encode(), priority: .normal)
+    }
+
     /// Write tool history entry frame to Buddy. No-op when not connected.
     func sendToolHistory(_ entry: BuddyToolHistoryPayload) {
         send(entry.encode(), priority: .auxiliary)

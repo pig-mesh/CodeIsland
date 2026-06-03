@@ -41,6 +41,14 @@ import Foundation
 ///   byte[0] = 0xE1
 ///   byte[1..6] = hostId
 ///
+/// Downlink task-run frame (≤ 20 bytes):
+///   byte[0] = 0xEF
+///   byte[1] = flags (bit0 active, bit1 completed, bit2 failed)
+///   byte[2..3] = elapsedSeconds UInt16 big-endian, clamped to 0...999
+///   byte[4..5] = taskRunSeq UInt16 big-endian
+///   byte[6] = taskIdLen (0..12)
+///   byte[7..] = taskIdShort UTF-8 (truncated to 12 bytes)
+///
 /// Uplink (button notify / notification action):
 ///   1 byte = currently displayed mascot sourceId (focus request), or
 ///   1 byte = control opcode (approve / deny / skip), or
@@ -83,14 +91,19 @@ public enum ESP32Protocol {
     public static let timeHintFrameMarker: UInt8 = 0xF6
     public static let toolHistoryFrameMarker: UInt8 = 0xF5
     public static let maxToolHistoryNameBytes = 11
+    public static let taskRunFrameMarker: UInt8 = 0xEF
+    public static let maxTaskRunIdBytes = 12
+    public static let maxTaskRunFrameBytes = 7 + maxTaskRunIdBytes
+    public static let maxTaskRunElapsedSeconds = 999
     public static let approveCurrentPermissionMarker: UInt8 = 0xF0
     public static let denyCurrentPermissionMarker: UInt8 = 0xF1
     public static let skipCurrentQuestionMarker: UInt8 = 0xF2
 
     // Pairing protocol (application-layer handshake over BLE write/notify).
-    // Reserved range: 0xE0–0xEF is reserved for pairing opcodes on both
-    // downlink and uplink. MascotID raw values MUST stay below 0xE0 to
-    // avoid collision with pair response parsing in BuddyUplinkEvent.
+    // 0xE0/0xE1 are downlink pairing opcodes, and 0xE0...0xE2 are uplink
+    // pairing responses. MascotID raw values MUST stay below 0xE0 to avoid
+    // collision with pair response parsing in BuddyUplinkEvent. 0xEF is used
+    // by the downlink task-run frame.
     public static let pairRequestMarker: UInt8 = 0xE0
     public static let unpairMarker: UInt8 = 0xE1
     public static let hostIdLength = 6
@@ -505,6 +518,72 @@ public struct BuddyTimeHintPayload: Equatable, Sendable {
 
     public func encode() -> Data {
         Data([ESP32Protocol.timeHintFrameMarker, hour])
+    }
+}
+
+public struct BuddyTaskRunFlags: OptionSet, Equatable, Sendable {
+    public let rawValue: UInt8
+
+    public init(rawValue: UInt8) {
+        self.rawValue = rawValue
+    }
+
+    public static let active = BuddyTaskRunFlags(rawValue: 1 << 0)
+    public static let completed = BuddyTaskRunFlags(rawValue: 1 << 1)
+    public static let failed = BuddyTaskRunFlags(rawValue: 1 << 2)
+}
+
+/// Task-run elapsed timer frame for Buddy (0xEF).
+public struct BuddyTaskRunPayload: Equatable, Sendable {
+    public let flags: BuddyTaskRunFlags
+    public let elapsedSeconds: UInt16
+    public let taskRunSeq: UInt16
+    public let taskIdShort: String?
+
+    public init(
+        flags: BuddyTaskRunFlags,
+        elapsedSeconds: Int,
+        taskRunSeq: Int,
+        taskIdShort: String?
+    ) {
+        self.flags = flags
+        self.elapsedSeconds = UInt16(min(max(elapsedSeconds, 0), ESP32Protocol.maxTaskRunElapsedSeconds))
+        self.taskRunSeq = UInt16(min(max(taskRunSeq, 0), Int(UInt16.max)))
+
+        let trimmed = taskIdShort?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.taskIdShort = trimmed?.isEmpty == false ? trimmed : nil
+    }
+
+    public static func active(elapsedSeconds: Int, taskRunSeq: Int, taskIdShort: String?) -> BuddyTaskRunPayload {
+        BuddyTaskRunPayload(flags: [.active], elapsedSeconds: elapsedSeconds, taskRunSeq: taskRunSeq, taskIdShort: taskIdShort)
+    }
+
+    public static func completed(elapsedSeconds: Int, taskRunSeq: Int, taskIdShort: String?) -> BuddyTaskRunPayload {
+        BuddyTaskRunPayload(flags: [.completed], elapsedSeconds: elapsedSeconds, taskRunSeq: taskRunSeq, taskIdShort: taskIdShort)
+    }
+
+    public static func failed(elapsedSeconds: Int, taskRunSeq: Int, taskIdShort: String?) -> BuddyTaskRunPayload {
+        BuddyTaskRunPayload(flags: [.failed], elapsedSeconds: elapsedSeconds, taskRunSeq: taskRunSeq, taskIdShort: taskIdShort)
+    }
+
+    public static func clear() -> BuddyTaskRunPayload {
+        BuddyTaskRunPayload(flags: [], elapsedSeconds: 0, taskRunSeq: 0, taskIdShort: nil)
+    }
+
+    public func encode() -> Data {
+        var data = Data()
+        data.reserveCapacity(ESP32Protocol.maxTaskRunFrameBytes)
+        data.append(ESP32Protocol.taskRunFrameMarker)
+        data.append(flags.rawValue)
+        data.append(UInt8(elapsedSeconds >> 8))
+        data.append(UInt8(elapsedSeconds & 0xFF))
+        data.append(UInt8(taskRunSeq >> 8))
+        data.append(UInt8(taskRunSeq & 0xFF))
+
+        let idBytes = Array((taskIdShort ?? "").utf8.prefix(ESP32Protocol.maxTaskRunIdBytes))
+        data.append(UInt8(idBytes.count))
+        data.append(contentsOf: idBytes)
+        return data
     }
 }
 

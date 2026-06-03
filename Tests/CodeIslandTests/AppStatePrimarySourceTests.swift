@@ -181,4 +181,107 @@ final class AppStatePrimarySourceTests: XCTestCase {
         appState.activeSessionId = "s2"
         XCTAssertEqual(appState.esp32DisplayIdentity(), "session:s2")
     }
+
+    func testBuddyTaskRunTrackerStartsAndTicksActivePrompt() {
+        var tracker = BuddyTaskRunTracker()
+        let start = Date(timeIntervalSince1970: 100)
+        var session = SessionSnapshot()
+        session.status = .processing
+        session.userPromptSequence = 1
+
+        let first = tracker.update(displaySessionId: "session-alpha", session: session, now: start, failedWhenEnding: false)
+        XCTAssertEqual(first, .active(elapsedSeconds: 0, taskRunSeq: 1, taskIdShort: "alpha-1"))
+
+        let duplicate = tracker.update(displaySessionId: "session-alpha", session: session, now: start.addingTimeInterval(0.4), failedWhenEnding: false)
+        XCTAssertNil(duplicate)
+
+        let second = tracker.update(displaySessionId: "session-alpha", session: session, now: start.addingTimeInterval(1.2), failedWhenEnding: false)
+        XCTAssertEqual(second, .active(elapsedSeconds: 1, taskRunSeq: 1, taskIdShort: "alpha-1"))
+    }
+
+    func testBuddyTaskRunTrackerKeepsCountingWhileWaiting() {
+        var tracker = BuddyTaskRunTracker()
+        let start = Date(timeIntervalSince1970: 100)
+        var session = SessionSnapshot()
+        session.status = .running
+        session.userPromptSequence = 1
+        _ = tracker.update(displaySessionId: "s1", session: session, now: start, failedWhenEnding: false)
+
+        session.status = .waitingApproval
+        let waiting = tracker.update(displaySessionId: "s1", session: session, now: start.addingTimeInterval(3), failedWhenEnding: false)
+        XCTAssertEqual(waiting, .active(elapsedSeconds: 3, taskRunSeq: 1, taskIdShort: "s1-1"))
+    }
+
+    func testBuddyTaskRunTrackerPreservesTimersAcrossRotatedSessions() {
+        var tracker = BuddyTaskRunTracker()
+        let start = Date(timeIntervalSince1970: 100)
+        var first = SessionSnapshot()
+        first.status = .running
+        first.userPromptSequence = 1
+        var second = SessionSnapshot()
+        second.status = .running
+        second.userPromptSequence = 1
+
+        XCTAssertEqual(
+            tracker.update(displaySessionId: "s1", session: first, now: start, failedWhenEnding: false),
+            .active(elapsedSeconds: 0, taskRunSeq: 1, taskIdShort: "s1-1")
+        )
+        XCTAssertEqual(
+            tracker.update(displaySessionId: "s2", session: second, now: start.addingTimeInterval(2), failedWhenEnding: false),
+            .active(elapsedSeconds: 0, taskRunSeq: 1, taskIdShort: "s2-1")
+        )
+        XCTAssertEqual(
+            tracker.update(displaySessionId: "s1", session: first, now: start.addingTimeInterval(4), failedWhenEnding: false),
+            .active(elapsedSeconds: 4, taskRunSeq: 1, taskIdShort: "s1-1")
+        )
+    }
+
+    func testBuddyTaskRunTrackerUsesPromptStartWhenFirstDisplayedLater() {
+        var tracker = BuddyTaskRunTracker()
+        let start = Date(timeIntervalSince1970: 100)
+        var session = SessionSnapshot()
+        session.status = .running
+        session.userPromptSequence = 1
+        session.userPromptStartedAt = start
+
+        let delayedDisplay = tracker.update(
+            displaySessionId: "s1",
+            session: session,
+            now: start.addingTimeInterval(5),
+            failedWhenEnding: false
+        )
+
+        XCTAssertEqual(delayedDisplay, .active(elapsedSeconds: 5, taskRunSeq: 1, taskIdShort: "s1-1"))
+    }
+
+    func testBuddyTaskRunTrackerFinalizesAndRestartsForSecondPrompt() {
+        var tracker = BuddyTaskRunTracker()
+        let start = Date(timeIntervalSince1970: 100)
+        var session = SessionSnapshot()
+        session.status = .running
+        session.userPromptSequence = 1
+        _ = tracker.update(displaySessionId: "s1", session: session, now: start, failedWhenEnding: false)
+
+        session.status = .idle
+        let complete = tracker.update(displaySessionId: "s1", session: session, now: start.addingTimeInterval(4), failedWhenEnding: false)
+        XCTAssertEqual(complete, .completed(elapsedSeconds: 4, taskRunSeq: 1, taskIdShort: "s1-1"))
+
+        session.status = .processing
+        session.userPromptSequence = 2
+        let next = tracker.update(displaySessionId: "s1", session: session, now: start.addingTimeInterval(8), failedWhenEnding: false)
+        XCTAssertEqual(next, .active(elapsedSeconds: 0, taskRunSeq: 2, taskIdShort: "s1-2"))
+    }
+
+    func testBuddyTaskRunTrackerEmitsFailedFinalFrame() {
+        var tracker = BuddyTaskRunTracker()
+        let start = Date(timeIntervalSince1970: 100)
+        var session = SessionSnapshot()
+        session.status = .running
+        session.userPromptSequence = 7
+        _ = tracker.update(displaySessionId: "s1", session: session, now: start, failedWhenEnding: false)
+
+        session.status = .idle
+        let failed = tracker.update(displaySessionId: "s1", session: session, now: start.addingTimeInterval(2), failedWhenEnding: true)
+        XCTAssertEqual(failed, .failed(elapsedSeconds: 2, taskRunSeq: 7, taskIdShort: "s1-7"))
+    }
 }

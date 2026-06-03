@@ -19,6 +19,8 @@ final class ESP32StatePublisher {
     private weak var appState: AppState?
     private let bridge: ESP32BridgeManager
     private var heartbeatTimer: Timer?
+    private var taskRunTimer: Timer?
+    private var taskRunTracker = BuddyTaskRunTracker()
     private var heartbeatInterval: TimeInterval = 5.0
     private var brightnessPercent: Double = Double(ESP32Protocol.defaultBrightnessPercent)
     private var screenOrientation: BuddyScreenOrientation = .up
@@ -58,6 +60,8 @@ final class ESP32StatePublisher {
         self.screenOrientation = screenOrientation
         heartbeatTimer?.invalidate()
         heartbeatTimer = nil
+        taskRunTimer?.invalidate()
+        taskRunTimer = nil
         interactiveRetryTask?.cancel()
         interactiveRetryTask = nil
         if enabled {
@@ -71,9 +75,15 @@ final class ESP32StatePublisher {
                     self?.flush(reason: "heartbeat")
                 }
             }
+            taskRunTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                Task { @MainActor in
+                    self?.sendTaskRun(reason: "task-run-tick")
+                }
+            }
         } else {
             endKeepAliveActivity()
             resetEventState()
+            _ = taskRunTracker.reset()
             bridge.stop()
         }
     }
@@ -131,8 +141,31 @@ final class ESP32StatePublisher {
             }
         }
         lastSentDisplay = SentDisplayState(identity: displayIdentity, status: currentStatus)
+        sendTaskRun(reason: reason)
 
         Self.log.debug("push(\(reason)): mascot=\(frame.mascot.sourceName) status=\(frame.status.rawValue) tool=\(frame.toolName ?? "")")
+    }
+
+    private func sendTaskRun(reason: String) {
+        guard let appState else { return }
+        guard bridge.status == .connected else { return }
+        guard bridge.selectedBuddyIdentifier != nil else { return }
+
+        let sessionId = appState.esp32DisplaySessionId()
+        let session = appState.esp32DisplaySession()
+        let failedWhenEnding = session?.toolHistory.last?.success == false
+
+        guard let payload = taskRunTracker.update(
+            displaySessionId: sessionId,
+            session: session,
+            now: Date(),
+            failedWhenEnding: failedWhenEnding
+        ) else {
+            return
+        }
+
+        bridge.sendTaskRun(payload)
+        Self.log.debug("task-run(\(reason)): seq=\(payload.taskRunSeq) elapsed=\(payload.elapsedSeconds) flags=\(payload.flags.rawValue)")
     }
 
     private func resetEventState() {

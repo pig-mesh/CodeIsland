@@ -56,6 +56,8 @@ public struct SessionSnapshot: Sendable {
     public var subagents: [String: SubagentState] = [:]
     public var startTime: Date = Date()
     public var lastUserPrompt: String?
+    public var userPromptSequence: UInt16 = 0
+    public var userPromptStartedAt: Date?
     public var lastAssistantMessage: String?
     /// Absolute path to the JSONL transcript currently backing this session. Populated
     /// by hooks (`transcript_path` field) and by filesystem discovery, consumed by the
@@ -578,6 +580,8 @@ public func reduceEvent(
     case "UserPromptSubmit":
         sessions[sessionId]?.interrupted = false
         sessions[sessionId]?.taskRoundEnded = false
+        sessions[sessionId]?.userPromptSequence &+= 1
+        sessions[sessionId]?.userPromptStartedAt = Date()
         sessions[sessionId]?.status = .processing
         sessions[sessionId]?.currentTool = nil
         sessions[sessionId]?.toolDescription = nil

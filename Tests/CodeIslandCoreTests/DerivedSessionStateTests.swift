@@ -45,6 +45,28 @@ final class DerivedSessionStateTests: XCTestCase {
         XCTAssertEqual(EventNormalizer.normalize("TaskCancel"), "TaskRoundComplete")
     }
 
+    func testUserPromptSubmitIncrementsPromptSequence() throws {
+        var sessions: [String: SessionSnapshot] = ["s1": SessionSnapshot()]
+
+        let first = try decode([
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "first",
+            "_source": "claude",
+        ])
+        _ = reduceEvent(sessions: &sessions, event: first, maxHistory: 10)
+        XCTAssertEqual(sessions["s1"]?.userPromptSequence, 1)
+
+        let second = try decode([
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "second",
+            "_source": "claude",
+        ])
+        _ = reduceEvent(sessions: &sessions, event: second, maxHistory: 10)
+        XCTAssertEqual(sessions["s1"]?.userPromptSequence, 2)
+    }
+
     func testAfterAgentResponseCompletesIDESource() throws {
         var session = SessionSnapshot()
         session.source = "cursor"
