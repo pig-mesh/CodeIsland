@@ -157,6 +157,22 @@ APP_SIGNED=false
 
 adhoc_sign_app_for_local_permissions() {
     echo "==> Ad-hoc signing app with local entitlements"
+    ADHOC_ENTITLEMENTS="$BUILD_DIR/CodeIsland-adhoc.entitlements"
+    cat > "$ADHOC_ENTITLEMENTS" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+	<key>com.apple.security.device.bluetooth</key>
+	<true/>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>
+EOF
+
     SPARKLE_FW="$CONTENTS_DIR/Frameworks/Sparkle.framework"
     SPARKLE_B="$SPARKLE_FW/Versions/B"
 
@@ -176,7 +192,7 @@ adhoc_sign_app_for_local_permissions() {
     done
 
     codesign --force --options runtime \
-        --entitlements "$REPO_ROOT/CodeIsland.entitlements" \
+        --entitlements "$ADHOC_ENTITLEMENTS" \
         --sign - \
         "$APP_DIR"
 }
