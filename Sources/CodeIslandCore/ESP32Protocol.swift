@@ -44,7 +44,7 @@ import Foundation
 /// Downlink task-run frame (≤ 20 bytes):
 ///   byte[0] = 0xEF
 ///   byte[1] = flags (bit0 active, bit1 completed, bit2 failed)
-///   byte[2..3] = elapsedSeconds UInt16 big-endian, clamped to 0...999
+///   byte[2..3] = elapsedSeconds UInt16 big-endian, clamped to 0...6000
 ///   byte[4..5] = taskRunSeq UInt16 big-endian
 ///   byte[6..7] = sessionKey UInt16 big-endian (FNV-16 of session id; 0 = all/invalid)
 ///   byte[8] = taskIdLen (0..9)
@@ -99,7 +99,7 @@ public enum ESP32Protocol {
     public static let maxTaskRunIdBytes = 9
     public static let taskRunSessionKeyBytes = 2
     public static let maxTaskRunFrameBytes = 9 + maxTaskRunIdBytes
-    public static let maxTaskRunElapsedSeconds = 999
+    public static let maxTaskRunElapsedSeconds = 6000
 
     /// Stable 16-bit key for a session id (FNV-1a, 16-bit folded). 0 is reserved for
     /// "all/invalid", so a real session that hashes to 0 is bumped to 1.

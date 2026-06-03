@@ -80,6 +80,7 @@ static char bleDeviceName[BLE_DEVICE_NAME_LEN] = "Buddy";
 #define BUDDY_TASK_RUN_FRAME            0xEF
 #define BUDDY_TASK_ID_MAX               9
 #define BUDDY_TASK_RUN_SLOTS            4
+#define BUDDY_TASK_RUN_MAX_ELAPSED_SECONDS 6000UL  // Display cap: 99:60
 
 // --- Pairing protocol ---
 #define PAIR_REQUEST_MARKER    0xE0
@@ -818,7 +819,7 @@ class CharCallbacks : public BLECharacteristicCallbacks {
 
       uint8_t flags = data[1];
       uint16_t elapsed = ((uint16_t)data[2] << 8) | data[3];
-      if (elapsed > 999) elapsed = 999;
+      if (elapsed > BUDDY_TASK_RUN_MAX_ELAPSED_SECONDS) elapsed = BUDDY_TASK_RUN_MAX_ELAPSED_SECONDS;
       uint16_t seq = ((uint16_t)data[4] << 8) | data[5];
       uint16_t sessionKey = ((uint16_t)data[6] << 8) | data[7];
       uint8_t idLen = data[8];
@@ -1063,8 +1064,31 @@ void drawAgentLamp(AgentLampState state, float t) {
 }
 
 void formatTaskElapsed(char* buf, size_t bufSize, unsigned long elapsedSeconds) {
-  if (elapsedSeconds > 999) elapsedSeconds = 999;
-  snprintf(buf, bufSize, "%lu", elapsedSeconds);
+  if (elapsedSeconds > BUDDY_TASK_RUN_MAX_ELAPSED_SECONDS) {
+    elapsedSeconds = BUDDY_TASK_RUN_MAX_ELAPSED_SECONDS;
+  }
+
+  if (elapsedSeconds < 60) {
+    snprintf(buf, bufSize, "%lu", elapsedSeconds);
+    return;
+  }
+
+  if (elapsedSeconds >= BUDDY_TASK_RUN_MAX_ELAPSED_SECONDS) {
+    snprintf(buf, bufSize, "99:60");
+    return;
+  }
+
+  unsigned long minutes = elapsedSeconds / 60UL;
+  unsigned long seconds = elapsedSeconds % 60UL;
+  snprintf(buf, bufSize, "%lu:%02lu", minutes, seconds);
+}
+
+uint8_t taskElapsedTextSize(const char* text) {
+  size_t len = strlen(text);
+  if (len <= 1) return 7;
+  if (len <= 2) return 6;
+  if (len <= 4) return 5;
+  return 4;
 }
 
 void drawTaskRunTimer(AgentLampState state) {
@@ -1085,7 +1109,7 @@ void drawTaskRunTimer(AgentLampState state) {
       // smoothly between frames (and immediately on 轮播 switch-back).
       unsigned long extra = (now_draw >= slot.baseMillis) ? (now_draw - slot.baseMillis) / 1000UL : 0;
       unsigned long shown = (unsigned long)slot.baseElapsed + extra;
-      localElapsed = (shown > 999) ? 999 : (uint16_t)shown;
+      localElapsed = (shown > BUDDY_TASK_RUN_MAX_ELAPSED_SECONDS) ? BUDDY_TASK_RUN_MAX_ELAPSED_SECONDS : (uint16_t)shown;
     } else {
       localElapsed = slot.baseElapsed;  // completed/failed 定格
     }
@@ -1096,7 +1120,7 @@ void drawTaskRunTimer(AgentLampState state) {
   char timeBuf[10];
   formatTaskElapsed(timeBuf, sizeof(timeBuf), localElapsed);
 
-  const uint8_t textSize = 5;
+  const uint8_t textSize = taskElapsedTextSize(timeBuf);
   int16_t tw = strlen(timeBuf) * 6 * textSize;
   int16_t th = 8 * textSize;
   int16_t x = (LCD_W - tw) / 2;

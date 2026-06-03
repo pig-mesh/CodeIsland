@@ -285,11 +285,11 @@ final class ESP32ProtocolTests: XCTestCase {
         XCTAssertEqual(data[8], 0) // empty id
     }
 
-    func testTaskRunElapsedClampsTo999() {
-        let frame = BuddyTaskRunPayload.active(elapsedSeconds: 1200, taskRunSeq: 7, sessionKey: 1, taskIdShort: nil)
-        XCTAssertEqual(frame.elapsedSeconds, 999)
+    func testTaskRunElapsedClampsToMaxDisplayElapsed() {
+        let frame = BuddyTaskRunPayload.active(elapsedSeconds: 7000, taskRunSeq: 7, sessionKey: 1, taskIdShort: nil)
+        XCTAssertEqual(frame.elapsedSeconds, 6000)
         let data = frame.encode()
-        XCTAssertEqual(UInt16(data[2]) << 8 | UInt16(data[3]), 999)
+        XCTAssertEqual(UInt16(data[2]) << 8 | UInt16(data[3]), 6000)
     }
 
     func testTaskRunIdTruncatesToNineBytes() {
