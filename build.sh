@@ -69,13 +69,10 @@ build_watch() {
 }
 
 build_mac() {
-    echo "Building $APP_NAME (universal)..."
+    echo "Building $APP_NAME (arm64)..."
     swift build -c release --arch arm64
-    swift build -c release --arch x86_64
 
-    echo "Creating universal binaries..."
     ARM_DIR=".build/arm64-apple-macosx/release"
-    X86_DIR=".build/x86_64-apple-macosx/release"
 
     echo "Creating app bundle..."
     rm -rf "$APP_BUNDLE"
@@ -84,10 +81,8 @@ build_mac() {
     mkdir -p "$APP_BUNDLE/Contents/Resources"
     mkdir -p "$APP_BUNDLE/Contents/Frameworks"
 
-    lipo -create "$ARM_DIR/$APP_NAME" "$X86_DIR/$APP_NAME" \
-         -output "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
-    lipo -create "$ARM_DIR/codeisland-bridge" "$X86_DIR/codeisland-bridge" \
-         -output "$APP_BUNDLE/Contents/Helpers/codeisland-bridge"
+    cp "$ARM_DIR/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+    cp "$ARM_DIR/codeisland-bridge" "$APP_BUNDLE/Contents/Helpers/codeisland-bridge"
     cp Info.plist "$APP_BUNDLE/Contents/Info.plist"
 
     echo "Embedding frameworks..."
@@ -130,6 +125,7 @@ build_mac() {
     done
 
     ENTITLEMENTS="CodeIsland.entitlements"
+    APP_ENTITLEMENTS="$ENTITLEMENTS"
 
     # Use SIGN_ID env var, or auto-detect: prefer "Developer ID Application" for distribution,
     # fall back to any valid identity, then ad-hoc
@@ -142,6 +138,15 @@ build_mac() {
     if [ -z "$SIGN_ID" ]; then
         echo "No developer certificate found, using ad-hoc signing..."
         SIGN_ID="-"
+    fi
+
+    if [ "$SIGN_ID" = "-" ]; then
+        APP_ENTITLEMENTS=".build/CodeIsland.adhoc.entitlements"
+        cp "$ENTITLEMENTS" "$APP_ENTITLEMENTS"
+        /usr/libexec/PlistBuddy -c "Add :com.apple.security.cs.disable-library-validation bool true" \
+            "$APP_ENTITLEMENTS" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :com.apple.security.cs.disable-library-validation true" \
+                "$APP_ENTITLEMENTS"
     fi
 
     echo "Code signing ($SIGN_ID)..."
@@ -161,7 +166,7 @@ build_mac() {
     codesign --force --options runtime --sign "$SIGN_ID" "$SPARKLE_FW"
 
     codesign --force --options runtime --sign "$SIGN_ID" "$APP_BUNDLE/Contents/Helpers/codeisland-bridge"
-    codesign --force --options runtime --sign "$SIGN_ID" --entitlements "$ENTITLEMENTS" "$APP_BUNDLE"
+    codesign --force --options runtime --sign "$SIGN_ID" --entitlements "$APP_ENTITLEMENTS" "$APP_BUNDLE"
 
     if [ "$NOTARIZE" = true ] && [[ "$SIGN_ID" == *"Developer ID"* ]]; then
         echo "Creating ZIP for notarization..."
