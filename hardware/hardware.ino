@@ -1,6 +1,6 @@
+#include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
-#include <SPI.h>
 #include <math.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -19,24 +19,77 @@
 //  Button: short=next mascot, long=toggle demo mode
 // =========================================================
 
-// --- LCD pins (board-fixed) ---
+// --- Board profiles ---
+#if !defined(BUDDY_BOARD_ESP32_C6_LCD_1_47) && !defined(BUDDY_BOARD_ESP32_S3_LCD_1_54)
+#define BUDDY_BOARD_ESP32_S3_LCD_1_54 1
+#endif
+
+#if defined(BUDDY_BOARD_ESP32_C6_LCD_1_47) && defined(BUDDY_BOARD_ESP32_S3_LCD_1_54)
+#error "Select only one Buddy board profile"
+#endif
+
+#if defined(BUDDY_BOARD_ESP32_S3_LCD_1_54)
+#define BUDDY_BOARD_NAME "Waveshare ESP32-S3-LCD-1.54"
+// LCD pins from the Waveshare Arduino demo.
+#define TFT_MOSI 39
+#define TFT_SCLK 38
+#define TFT_CS   21
+#define TFT_DC   45
+#define TFT_RST  40
+#define TFT_BL   46
+#define BTN_PIN  4
+#define BTN_LABEL "PLUS"
+#define BUDDY_POWER_HOLD_PIN 2
+#define BUDDY_POWER_BUTTON_PIN 5
+#define BUDDY_POWER_BUTTON_LABEL "PWR"
+#define BACKLIGHT_ACTIVE_HIGH true
+#define LCD_W    240
+#define LCD_H    240
+#define LCD_ROT  2
+#define LCD_INVERT true
+#elif defined(BUDDY_BOARD_ESP32_C6_LCD_1_47)
+#define BUDDY_BOARD_NAME "Waveshare ESP32-C6-LCD-1.47"
 #define TFT_MOSI 6
 #define TFT_SCLK 7
 #define TFT_CS   14
 #define TFT_DC   15
 #define TFT_RST  21
 #define TFT_BL   22
-
-// --- Button ---
 #define BTN_PIN  9
-
-// --- Display ---
+#define BTN_LABEL "BOOT"
+#define BUDDY_POWER_HOLD_PIN -1
+#define BUDDY_POWER_BUTTON_PIN -1
+#define BUDDY_POWER_BUTTON_LABEL "PWR"
 #define BACKLIGHT_ACTIVE_HIGH true
 #define LCD_W    172
 #define LCD_H    320
 #define LCD_ROT  2
+#define LCD_INVERT false
+#endif
+
+// --- Display ---
+#define UI_COMPACT (LCD_H <= 240)
+#define LAMP_CENTER_Y (UI_COMPACT ? (LCD_H / 2) : 150)
+#define LAMP_OUTER_BASE (UI_COMPACT ? 94 : 136)
+#define LAMP_OUTER_BREATH (UI_COMPACT ? 18 : 24)
+#define LAMP_CORE_BASE (UI_COMPACT ? 28 : 34)
+#define LAMP_CORE_BREATH (UI_COMPACT ? 44 : 55)
+#define SLEEP_WORKSPACE_Y (UI_COMPACT ? 180 : 218)
+#define STATS_PANEL_Y (UI_COMPACT ? 196 : 236)
+#define TOOL_TIMELINE_Y (UI_COMPACT ? 208 : 248)
+#define ALERT_WORKSPACE_Y (UI_COMPACT ? 176 : 268)
+#define ALERT_TOOL_Y (UI_COMPACT ? 194 : 286)
+#define WORK_WORKSPACE_Y (UI_COMPACT ? 206 : 286)
+#define WORK_TOOL_Y (UI_COMPACT ? 222 : 304)
+#define ONBOARD_QR_SCALE (UI_COMPACT ? 3 : 4)
+#define ONBOARD_QR_Y (UI_COMPACT ? 70 : 84)
+#define PAIR_TITLE_Y (UI_COMPACT ? 28 : 40)
+#define PAIR_HOST_Y (UI_COMPACT ? 62 : 80)
+#define PAIR_ACCEPT_Y (UI_COMPACT ? 108 : 140)
+#define PAIR_DENY_Y (UI_COMPACT ? 172 : 210)
 #define DEBOUNCE_MS 30
 #define LONG_PRESS_MS 600
+#define POWER_LONG_PRESS_MS 1500
 
 // --- Backlight PWM (reduce heat) ---
 #define BL_PWM_CHANNEL  0
@@ -95,7 +148,6 @@ static char bleDeviceName[BLE_DEVICE_NAME_LEN] = "Buddy";
 
 // QR code for https://github.com/wxtsky/CodeIsland (version 3, ECC M, border 2).
 #define CODEISLAND_QR_SIZE 33
-#define CODEISLAND_QR_SCALE 4
 static const char CODEISLAND_QR[CODEISLAND_QR_SIZE][CODEISLAND_QR_SIZE + 1] PROGMEM = {
   "000000000000000000000000000000000",
   "000000000000000000000000000000000",
@@ -496,6 +548,62 @@ int pollButton(unsigned long now) {
   if (btnStable == LOW) { btnPressed = true; btnLongFired = false; btnPressStart = now; return 0; }
   btnPressed = false;
   return btnLongFired ? 0 : 1;
+}
+
+// --- Power button state (S3 battery profile) ---
+bool   pwrStable   = HIGH;
+bool   pwrLastRead = HIGH;
+unsigned long pwrLastChange = 0;
+unsigned long pwrPressStart = 0;
+bool   pwrPressed = false;
+bool   pwrLongFired = false;
+bool   pwrArmedAfterBoot = false;
+
+int pollPowerButton(unsigned long now) {
+#if BUDDY_POWER_BUTTON_PIN >= 0
+  bool raw = digitalRead(BUDDY_POWER_BUTTON_PIN);
+  if (raw != pwrLastRead) { pwrLastRead = raw; pwrLastChange = now; }
+  if ((now - pwrLastChange) < DEBOUNCE_MS) return 0;
+  if (!pwrArmedAfterBoot) {
+    if (raw == HIGH) {
+      pwrArmedAfterBoot = true;
+      pwrStable = HIGH;
+      pwrPressed = false;
+      pwrLongFired = false;
+      Serial.println("[PWR]  Button armed after release");
+    }
+    return 0;
+  }
+  if (pwrStable == pwrLastRead) {
+    if (pwrPressed && !pwrLongFired && (now - pwrPressStart) >= POWER_LONG_PRESS_MS) {
+      pwrLongFired = true;
+      return 2;
+    }
+    return 0;
+  }
+  pwrStable = pwrLastRead;
+  if (pwrStable == LOW) { pwrPressed = true; pwrLongFired = false; pwrPressStart = now; return 0; }
+  pwrPressed = false;
+  return pwrLongFired ? 0 : 1;
+#else
+  (void)now;
+  return 0;
+#endif
+}
+
+void buddyPowerOff() {
+#if BUDDY_POWER_HOLD_PIN >= 0
+  Serial.println("[PWR]  Long press -> power off");
+  canvas.fillScreen(0x0000);
+  drawCenteredText("Power off", LCD_H / 2 - 10, 2, RGB565(220, 220, 230));
+  tft.drawRGBBitmap(0, 0, canvas.getBuffer(), LCD_W, LCD_H);
+  ledcWrite(TFT_BL, sleepBrightness());
+  delay(250);
+  ledcWrite(TFT_BL, 0);
+  digitalWrite(BUDDY_POWER_HOLD_PIN, LOW);
+  delay(1000);
+  Serial.println("[PWR]  BAT_EN released; USB power may keep the board alive");
+#endif
 }
 
 static void rememberBleConnection(uint16_t connId) {
@@ -1055,9 +1163,9 @@ void drawAgentLamp(AgentLampState state, float t) {
 
   float breath = agentLampBreath(state, t);
   int16_t cx = LCD_W / 2;
-  int16_t cy = 150;
-  int16_t outerRadius = (int16_t)(136 + breath * 24);
-  int16_t coreRadius = min((int16_t)(34 + breath * 55), (int16_t)(LCD_W / 2));
+  int16_t cy = LAMP_CENTER_Y;
+  int16_t outerRadius = (int16_t)(LAMP_OUTER_BASE + breath * LAMP_OUTER_BREATH);
+  int16_t coreRadius = min((int16_t)(LAMP_CORE_BASE + breath * LAMP_CORE_BREATH), (int16_t)(LCD_W / 2));
 
   fillLampCircle(cx, cy, outerRadius, r, g, b, breath * 0.34f);
   fillLampCircle(cx, cy, coreRadius, r, g, b, 0.46f + breath * 0.54f);
@@ -1124,7 +1232,7 @@ void drawTaskRunTimer(AgentLampState state) {
   int16_t tw = strlen(timeBuf) * 6 * textSize;
   int16_t th = 8 * textSize;
   int16_t x = (LCD_W - tw) / 2;
-  int16_t y = 150 - th / 2;
+  int16_t y = LAMP_CENTER_Y - th / 2;
 
   uint16_t shadowColor = RGB565(248, 252, 245);
   uint16_t textColor = RGB565(0, 18, 8);
@@ -1266,7 +1374,7 @@ void drawStatsPanel() {
 
   if (actS == 0 && totS == 0 && toolC == 0) return;
 
-  int panelY = 236;
+  int panelY = STATS_PANEL_Y;
   char buf[32];
   gfx->setTextSize(1);
   gfx->setTextColor(RGB565(100, 100, 120));
@@ -1280,7 +1388,7 @@ void drawStatsPanel() {
 // --- Draw tool history timeline (shown during idle, below stats) ---
 void drawToolTimeline() {
   if (toolHistCount == 0) return;
-  int startY = 248;
+  int startY = TOOL_TIMELINE_Y;
   gfx->setTextSize(1);
   uint8_t localCount;
   ToolHistEntry localHist[MAX_TOOL_HISTORY];
@@ -1289,7 +1397,7 @@ void drawToolTimeline() {
   memcpy(localHist, toolHistory, sizeof(localHist));
   portEXIT_CRITICAL(&bleMux);
 
-  uint8_t maxVisible = min(localCount, (uint8_t)5);
+  uint8_t maxVisible = min(localCount, (uint8_t)(UI_COMPACT ? 2 : 5));
   for (uint8_t i = 0; i < maxVisible; i++) {
     int y = startY + i * 10;
     uint16_t markCol = localHist[i].success ? RGB565(50, 200, 50) : RGB565(200, 60, 60);
@@ -1366,21 +1474,21 @@ void drawStatusBar() {
 
 // --- Draw pair confirmation screen ---
 void drawPairConfirmScreen(float t) {
-  drawCenteredText("Pair?", 40, 3, RGB565(235, 235, 245));
+  drawCenteredText("Pair?", PAIR_TITLE_Y, 3, RGB565(235, 235, 245));
 
   char hostHex[18];
   snprintf(hostHex, sizeof(hostHex), "%02X%02X%02X-%02X%02X%02X",
     pendingHostId[0], pendingHostId[1], pendingHostId[2],
     pendingHostId[3], pendingHostId[4], pendingHostId[5]);
-  drawCenteredText(hostHex, 80, 1, RGB565(120, 200, 255));
+  drawCenteredText(hostHex, PAIR_HOST_Y, 1, RGB565(120, 200, 255));
 
   float pulse = (sinf(t * 2.5f) + 1.0f) * 0.5f;
   uint8_t g = 140 + (uint8_t)(pulse * 60);
-  drawCenteredText("Press BOOT", 140, 2, RGB565(50, (uint8_t)g, 50));
-  drawCenteredText("to accept", 162, 2, RGB565(50, (uint8_t)g, 50));
+  drawCenteredText("Press " BTN_LABEL, PAIR_ACCEPT_Y, 2, RGB565(50, (uint8_t)g, 50));
+  drawCenteredText("to accept", PAIR_ACCEPT_Y + 22, 2, RGB565(50, (uint8_t)g, 50));
 
-  drawCenteredText("Hold BOOT", 210, 1, RGB565(180, 80, 80));
-  drawCenteredText("to reject", 224, 1, RGB565(180, 80, 80));
+  drawCenteredText("Hold " BTN_LABEL, PAIR_DENY_Y, 1, RGB565(180, 80, 80));
+  drawCenteredText("to reject", PAIR_DENY_Y + 14, 1, RGB565(180, 80, 80));
 
   unsigned long elapsed = millis() - pairRequestTime;
   unsigned long remaining = 0;
@@ -1394,21 +1502,21 @@ void drawPairConfirmScreen(float t) {
 
 // --- Draw onboarding screen ---
 void drawOnboardScreen(float t) {
-  drawCenteredText("Buddy", 22, 3, RGB565(235, 235, 245));
-  drawCenteredText(bleDeviceName, 50, 1, RGB565(120, 200, 255));
-  drawCenteredText("Scan to get app", 64, 1, RGB565(130, 130, 150));
+  drawCenteredText("Buddy", UI_COMPACT ? 16 : 22, 3, RGB565(235, 235, 245));
+  drawCenteredText(bleDeviceName, UI_COMPACT ? 44 : 50, 1, RGB565(120, 200, 255));
+  drawCenteredText("Scan to get app", UI_COMPACT ? 56 : 64, 1, RGB565(130, 130, 150));
 
-  int qrPixels = CODEISLAND_QR_SIZE * CODEISLAND_QR_SCALE;
+  int qrPixels = CODEISLAND_QR_SIZE * ONBOARD_QR_SCALE;
   int qrX = (LCD_W - qrPixels) / 2;
-  int qrY = 84;
-  drawCodeIslandQR(qrX, qrY, CODEISLAND_QR_SCALE);
+  int qrY = ONBOARD_QR_Y;
+  drawCodeIslandQR(qrX, qrY, ONBOARD_QR_SCALE);
 
-  int y = qrY + qrPixels + 16;
+  int y = qrY + qrPixels + (UI_COMPACT ? 10 : 16);
   drawCenteredText("Open CodeIsland", y, 1, RGB565(170, 170, 190));
-  drawCenteredText("Settings > Buddy", y + 14, 1, RGB565(120, 200, 255));
-  drawCenteredText("Connect by Bluetooth", y + 28, 1, RGB565(130, 130, 150));
+  drawCenteredText("Settings > Buddy", y + (UI_COMPACT ? 12 : 14), 1, RGB565(120, 200, 255));
+  drawCenteredText("Connect by Bluetooth", y + (UI_COMPACT ? 24 : 28), 1, RGB565(130, 130, 150));
 
-  y += 50;
+  y += UI_COMPACT ? 38 : 50;
   if (bleConnected) {
     drawCenteredText("Bluetooth connected", y, 1, RGB565(50, 230, 50));
   } else {
@@ -1429,12 +1537,22 @@ void drawOnboardScreen(float t) {
 //  Setup
 // ============================================================
 void setup() {
+#if BUDDY_POWER_HOLD_PIN >= 0
+  pinMode(BUDDY_POWER_HOLD_PIN, OUTPUT);
+  digitalWrite(BUDDY_POWER_HOLD_PIN, HIGH);
+#endif
+
   Serial.begin(115200);
   delay(100);
   Serial.println();
   Serial.println("========================================");
   Serial.println("  Buddy — Multi-mascot Bluetooth Pet");
   Serial.println("========================================");
+  Serial.printf("[BOARD] %s\n", BUDDY_BOARD_NAME);
+
+#if BUDDY_POWER_HOLD_PIN >= 0
+  Serial.printf("[PWR]  Hold pin GPIO%d set HIGH\n", BUDDY_POWER_HOLD_PIN);
+#endif
 
   // NVS — restore persisted settings
   prefs.begin("buddy", false);
@@ -1478,9 +1596,15 @@ void setup() {
   Serial.printf("[LCD]  Backlight PWM: freq=%dHz bits=%d brightness=%d/255 (%d%%)\n",
     BL_PWM_FREQ, BL_PWM_BITS, currentBrightness, buddyBrightnessPercent);
   pinMode(BTN_PIN, INPUT_PULLUP);
-  Serial.printf("[BTN]  Pin=%d (INPUT_PULLUP)\n", BTN_PIN);
+  Serial.printf("[BTN]  %s Pin=%d (INPUT_PULLUP)\n", BTN_LABEL, BTN_PIN);
+#if BUDDY_POWER_BUTTON_PIN >= 0
+  pinMode(BUDDY_POWER_BUTTON_PIN, INPUT_PULLUP);
+  Serial.printf("[PWR]  %s Pin=%d (INPUT_PULLUP, long-press power off)\n",
+    BUDDY_POWER_BUTTON_LABEL, BUDDY_POWER_BUTTON_PIN);
+#endif
   SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
   tft.init(LCD_W, LCD_H);
+  tft.invertDisplay(LCD_INVERT);
   applyBuddyScreenOrientation(buddyScreenOrientation);
   Serial.printf("[LCD]  Canvas buffer: %d bytes\n", LCD_W * LCD_H * 2);
   Serial.println("[LCD]  OK");
@@ -1589,6 +1713,14 @@ void loop() {
 
   // Button handling
   int btn = pollButton(now);
+  int pwrBtn = pollPowerButton(now);
+  if (pwrBtn == 2) {
+    buddyPowerOff();
+    return;
+  }
+  if (pwrBtn == 1) {
+    Serial.println("[PWR]  Short press ignored");
+  }
   if (btn != 0) {
     lastWakeActivity = now;
   }
@@ -1906,17 +2038,17 @@ void loop() {
     // Info area (AGENT mode only)
     if (appMode == MODE_AGENT && !playingTransient) {
       if (drawScene == SCENE_SLEEP) {
-        drawWorkspaceLabel(218);
+        drawWorkspaceLabel(SLEEP_WORKSPACE_Y);
         drawStatsPanel();
         drawToolTimeline();
         drawHeatmapBar();
       } else if (drawScene == SCENE_ALERT || drawScene == SCENE_QUESTION) {
-        drawWorkspaceLabel(268);
-        drawToolLabel(286);
+        drawWorkspaceLabel(ALERT_WORKSPACE_Y);
+        drawToolLabel(ALERT_TOOL_Y);
         drawAlertActionHints(drawStatus);
       } else {
-        drawWorkspaceLabel(286);
-        drawToolLabel(304);
+        drawWorkspaceLabel(WORK_WORKSPACE_Y);
+        drawToolLabel(WORK_TOOL_Y);
       }
     }
   }

@@ -6,8 +6,17 @@ extern GFXcanvas16* gfx;
 
 #define RGB565(r, g, b) (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3))
 
-#define LCD_W_  172
-#define LCD_H_  320
+#ifndef LCD_W
+#error "LCD_W must be defined before including mascot_common.h"
+#endif
+
+#ifndef LCD_H
+#error "LCD_H must be defined before including mascot_common.h"
+#endif
+
+#define LCD_W_  LCD_W
+#define LCD_H_  LCD_H
+#define VIEWPORT_MAX_SCALE_ (LCD_H_ <= 240 ? 13.0f : 999.0f)
 
 static float vpS = LCD_W_ / 15.0f;
 static float vpOX = 0.0f;
@@ -19,6 +28,7 @@ inline void useViewport(float svgW, float svgH, float svgY0) {
   float sxScale = LCD_W_ / svgW;
   float syScale = LCD_H_ / svgH;
   vpS = fminf(sxScale, syScale);
+  if (vpS > VIEWPORT_MAX_SCALE_) vpS = VIEWPORT_MAX_SCALE_;
   vpOX = (LCD_W_ - svgW * vpS) / 2.0f;
   vpOY = (LCD_H_ - svgH * vpS) / 2.0f;
   vpY0 = svgY0;
