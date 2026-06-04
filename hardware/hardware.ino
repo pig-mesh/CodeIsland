@@ -8,6 +8,8 @@
 #include <BLE2902.h>
 #include <pgmspace.h>
 #include <Preferences.h>
+#include <Wire.h>
+#include "driver/i2s_std.h"
 #ifdef BUDDY_OTA_ENABLED
 #include <WiFi.h>
 #include <ArduinoOTA.h>
@@ -42,6 +44,14 @@
 #define BUDDY_POWER_HOLD_PIN 2
 #define BUDDY_POWER_BUTTON_PIN 5
 #define BUDDY_POWER_BUTTON_LABEL "PWR"
+#define BUDDY_AUDIO_ENABLED 1
+#define BUDDY_AUDIO_PA_CTRL 7
+#define BUDDY_AUDIO_MCLK 8
+#define BUDDY_AUDIO_BCLK 9
+#define BUDDY_AUDIO_DOUT 12
+#define BUDDY_AUDIO_LRC  10
+#define BUDDY_AUDIO_I2C_SDA 42
+#define BUDDY_AUDIO_I2C_SCL 41
 #define BACKLIGHT_ACTIVE_HIGH true
 #define LCD_W    240
 #define LCD_H    240
@@ -60,6 +70,14 @@
 #define BUDDY_POWER_HOLD_PIN -1
 #define BUDDY_POWER_BUTTON_PIN -1
 #define BUDDY_POWER_BUTTON_LABEL "PWR"
+#define BUDDY_AUDIO_ENABLED 0
+#define BUDDY_AUDIO_PA_CTRL -1
+#define BUDDY_AUDIO_MCLK -1
+#define BUDDY_AUDIO_BCLK -1
+#define BUDDY_AUDIO_DOUT -1
+#define BUDDY_AUDIO_LRC  -1
+#define BUDDY_AUDIO_I2C_SDA -1
+#define BUDDY_AUDIO_I2C_SCL -1
 #define BACKLIGHT_ACTIVE_HIGH true
 #define LCD_W    172
 #define LCD_H    320
@@ -90,6 +108,13 @@
 #define DEBOUNCE_MS 30
 #define LONG_PRESS_MS 600
 #define POWER_LONG_PRESS_MS 1500
+
+// --- Audio cue (ESP32-S3-LCD-1.54: ES8311 codec + NS4150B PA) ---
+#define BUDDY_AUDIO_SAMPLE_RATE 16000
+#define BUDDY_AUDIO_VOLUME 65
+#define BUDDY_AUDIO_BEEP_HZ 1760.0f
+#define BUDDY_AUDIO_BEEP_MS 130
+#define BUDDY_AUDIO_COOLDOWN_MS 250UL
 
 // --- Backlight PWM (reduce heat) ---
 #define BL_PWM_CHANNEL  0
@@ -217,6 +242,17 @@ char              bleWorkspaceName[20] = {0};
 char              bleModelName[20] = {0};
 BLECharacteristic* pNotifyChar = nullptr;
 portMUX_TYPE      bleMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool     pendingTaskCompleteBeep = false;
+bool              lastTaskCompleteBeepValid = false;
+uint16_t          lastTaskCompleteBeepSessionKey = 0;
+uint16_t          lastTaskCompleteBeepSeq = 0;
+
+#if BUDDY_AUDIO_ENABLED
+i2s_chan_handle_t buddyAudioTx = nullptr;
+bool              buddyAudioReady = false;
+bool              buddyAudioRunning = false;
+unsigned long     lastBuddyAudioBeepMs = 0;
+#endif
 
 // --- Session stats from BLE ---
 uint8_t bleActiveSessionCount = 0;
@@ -594,6 +630,7 @@ int pollPowerButton(unsigned long now) {
 void buddyPowerOff() {
 #if BUDDY_POWER_HOLD_PIN >= 0
   Serial.println("[PWR]  Long press -> power off");
+  buddyAudioPowerDown();
   canvas.fillScreen(0x0000);
   drawCenteredText("Power off", LCD_H / 2 - 10, 2, RGB565(220, 220, 230));
   tft.drawRGBBitmap(0, 0, canvas.getBuffer(), LCD_W, LCD_H);
@@ -643,6 +680,252 @@ static void disconnectCurrentClient(const char* reason) {
   server->disconnect(connId);
   Serial.printf("[BLE]  Disconnecting client (%s, connId=%u)\n", reason, connId);
 }
+
+static void queueTaskCompleteBeep(uint16_t sessionKey, uint16_t seq) {
+  bool queued = false;
+  portENTER_CRITICAL(&bleMux);
+  if (!lastTaskCompleteBeepValid ||
+      sessionKey != lastTaskCompleteBeepSessionKey ||
+      seq != lastTaskCompleteBeepSeq) {
+    lastTaskCompleteBeepValid = true;
+    lastTaskCompleteBeepSessionKey = sessionKey;
+    lastTaskCompleteBeepSeq = seq;
+    pendingTaskCompleteBeep = true;
+    queued = true;
+  }
+  portEXIT_CRITICAL(&bleMux);
+  if (queued) {
+    Serial.printf("[AUDIO] Task complete beep queued: key=%u seq=%u\n", sessionKey, seq);
+  }
+}
+
+static bool consumeTaskCompleteBeep() {
+  bool pending = false;
+  portENTER_CRITICAL(&bleMux);
+  if (pendingTaskCompleteBeep) {
+    pendingTaskCompleteBeep = false;
+    pending = true;
+  }
+  portEXIT_CRITICAL(&bleMux);
+  return pending;
+}
+
+#if BUDDY_AUDIO_ENABLED
+static bool buddyAudioWriteReg(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(0x18);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+static bool buddyAudioReadReg(uint8_t reg, uint8_t* value) {
+  Wire.beginTransmission(0x18);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(0x18, 1) != 1) return false;
+  *value = Wire.read();
+  return true;
+}
+
+static bool buddyAudioSetMute(bool muted) {
+  uint8_t reg31 = 0;
+  buddyAudioReadReg(0x31, &reg31);
+  if (muted) reg31 |= 0x60;
+  else reg31 &= (uint8_t)~0x60;
+  return buddyAudioWriteReg(0x31, reg31);
+}
+
+static bool buddyAudioCodecInit() {
+  bool ok = true;
+  ok &= buddyAudioWriteReg(0x00, 0x1F);
+  delay(20);
+  ok &= buddyAudioWriteReg(0x00, 0x00);
+  ok &= buddyAudioWriteReg(0x00, 0x80);
+
+  // 16 kHz, 16-bit I2S slave, MCLK = sample_rate * 256 = 4.096 MHz.
+  ok &= buddyAudioWriteReg(0x01, 0x3F);
+  ok &= buddyAudioWriteReg(0x02, 0x00);
+  ok &= buddyAudioWriteReg(0x03, 0x10);
+  ok &= buddyAudioWriteReg(0x04, 0x10);
+  ok &= buddyAudioWriteReg(0x05, 0x00);
+  ok &= buddyAudioWriteReg(0x06, 0x03);
+  ok &= buddyAudioWriteReg(0x07, 0x00);
+  ok &= buddyAudioWriteReg(0x08, 0xFF);
+  ok &= buddyAudioWriteReg(0x09, 0x0C);
+  ok &= buddyAudioWriteReg(0x0A, 0x0C);
+
+  ok &= buddyAudioWriteReg(0x0D, 0x01);
+  ok &= buddyAudioWriteReg(0x0E, 0x02);
+  ok &= buddyAudioWriteReg(0x12, 0x00);
+  ok &= buddyAudioWriteReg(0x13, 0x10);
+  ok &= buddyAudioWriteReg(0x14, 0x1A);
+  ok &= buddyAudioWriteReg(0x17, 0xC8);
+  ok &= buddyAudioWriteReg(0x1C, 0x6A);
+  ok &= buddyAudioWriteReg(0x37, 0x08);
+
+  int volume = BUDDY_AUDIO_VOLUME;
+  if (volume < 0) volume = 0;
+  if (volume > 100) volume = 100;
+  uint8_t reg32 = volume == 0 ? 0 : (uint8_t)((volume * 256 / 100) - 1);
+  ok &= buddyAudioWriteReg(0x32, reg32);
+  ok &= buddyAudioSetMute(true);
+  return ok;
+}
+
+static bool buddyAudioEnsureI2S() {
+  if (buddyAudioTx) return true;
+
+  i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  chanCfg.dma_desc_num = 4;
+  chanCfg.dma_frame_num = 128;
+  chanCfg.auto_clear_after_cb = true;
+  esp_err_t err = i2s_new_channel(&chanCfg, &buddyAudioTx, nullptr);
+  if (err != ESP_OK) {
+    Serial.printf("[AUDIO] I2S channel init failed: %d\n", err);
+    buddyAudioTx = nullptr;
+    return false;
+  }
+
+  i2s_std_clk_config_t clkCfg = I2S_STD_CLK_DEFAULT_CONFIG(BUDDY_AUDIO_SAMPLE_RATE);
+  i2s_std_slot_config_t slotCfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
+  i2s_std_gpio_config_t gpioCfg = {};
+  gpioCfg.mclk = (gpio_num_t)BUDDY_AUDIO_MCLK;
+  gpioCfg.bclk = (gpio_num_t)BUDDY_AUDIO_BCLK;
+  gpioCfg.ws = (gpio_num_t)BUDDY_AUDIO_LRC;
+  gpioCfg.dout = (gpio_num_t)BUDDY_AUDIO_DOUT;
+  gpioCfg.din = I2S_GPIO_UNUSED;
+
+  i2s_std_config_t stdCfg = {};
+  stdCfg.clk_cfg = clkCfg;
+  stdCfg.slot_cfg = slotCfg;
+  stdCfg.gpio_cfg = gpioCfg;
+  err = i2s_channel_init_std_mode(buddyAudioTx, &stdCfg);
+  if (err != ESP_OK) {
+    Serial.printf("[AUDIO] I2S std init failed: %d\n", err);
+    i2s_del_channel(buddyAudioTx);
+    buddyAudioTx = nullptr;
+    return false;
+  }
+  return true;
+}
+
+static bool buddyAudioEnableI2S() {
+  if (!buddyAudioTx) return false;
+  if (buddyAudioRunning) return true;
+  esp_err_t err = i2s_channel_enable(buddyAudioTx);
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    Serial.printf("[AUDIO] I2S enable failed: %d\n", err);
+    return false;
+  }
+  buddyAudioRunning = true;
+  return true;
+}
+
+static void buddyAudioDisableI2S() {
+  if (!buddyAudioTx || !buddyAudioRunning) return;
+  esp_err_t err = i2s_channel_disable(buddyAudioTx);
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    Serial.printf("[AUDIO] I2S disable failed: %d\n", err);
+  }
+  buddyAudioRunning = false;
+}
+
+static bool buddyAudioEnsureReady() {
+  if (buddyAudioReady) return true;
+  pinMode(BUDDY_AUDIO_PA_CTRL, OUTPUT);
+  digitalWrite(BUDDY_AUDIO_PA_CTRL, LOW);
+  Wire.begin(BUDDY_AUDIO_I2C_SDA, BUDDY_AUDIO_I2C_SCL);
+
+  if (!buddyAudioEnsureI2S() || !buddyAudioEnableI2S()) return false;
+  delay(10);
+  buddyAudioReady = buddyAudioCodecInit();
+  buddyAudioDisableI2S();
+
+  if (!buddyAudioReady) {
+    Serial.println("[AUDIO] ES8311 init failed");
+    return false;
+  }
+  Serial.printf("[AUDIO] ES8311 ready, PA=%d MCLK=%d BCLK=%d LRC=%d DOUT=%d\n",
+    BUDDY_AUDIO_PA_CTRL, BUDDY_AUDIO_MCLK, BUDDY_AUDIO_BCLK,
+    BUDDY_AUDIO_LRC, BUDDY_AUDIO_DOUT);
+  return true;
+}
+
+static void buddyAudioWriteSilence(uint16_t frames) {
+  if (!buddyAudioTx) return;
+  int16_t silence[64 * 2] = {0};
+  while (frames > 0) {
+    uint16_t chunk = min((uint16_t)64, frames);
+    size_t written = 0;
+    i2s_channel_write(buddyAudioTx, silence, chunk * 2 * sizeof(int16_t), &written, 100);
+    frames -= chunk;
+  }
+}
+
+static void buddyAudioPlayCompletionBeep() {
+  unsigned long now = millis();
+  if (now - lastBuddyAudioBeepMs < BUDDY_AUDIO_COOLDOWN_MS) return;
+  lastBuddyAudioBeepMs = now;
+
+  if (!buddyAudioEnsureReady() || !buddyAudioEnableI2S()) return;
+
+  buddyAudioWriteSilence(32);
+  digitalWrite(BUDDY_AUDIO_PA_CTRL, HIGH);
+  delay(4);
+  buddyAudioSetMute(false);
+
+  const int totalFrames = (BUDDY_AUDIO_SAMPLE_RATE * BUDDY_AUDIO_BEEP_MS) / 1000;
+  const float phaseStep = (2.0f * 3.14159265f * BUDDY_AUDIO_BEEP_HZ) / BUDDY_AUDIO_SAMPLE_RATE;
+  const float amplitude = 11500.0f;
+  float phase = 0.0f;
+  int frame = 0;
+  int16_t samples[64 * 2];
+
+  while (frame < totalFrames) {
+    int chunk = min(64, totalFrames - frame);
+    for (int i = 0; i < chunk; i++) {
+      int sampleIndex = frame + i;
+      float attack = min(1.0f, sampleIndex / 96.0f);
+      float release = min(1.0f, (totalFrames - sampleIndex) / 160.0f);
+      float envelope = min(attack, release);
+      int16_t sample = (int16_t)(sinf(phase) * amplitude * envelope);
+      samples[i * 2] = sample;
+      samples[i * 2 + 1] = sample;
+      phase += phaseStep;
+      if (phase > 2.0f * 3.14159265f) phase -= 2.0f * 3.14159265f;
+    }
+    size_t written = 0;
+    i2s_channel_write(buddyAudioTx, samples, chunk * 2 * sizeof(int16_t), &written, 100);
+    frame += chunk;
+  }
+
+  buddyAudioWriteSilence(160);
+  buddyAudioSetMute(true);
+  delay(2);
+  digitalWrite(BUDDY_AUDIO_PA_CTRL, LOW);
+  buddyAudioDisableI2S();
+  Serial.println("[AUDIO] Task complete beep played");
+}
+
+static void buddyAudioPoll() {
+  if (consumeTaskCompleteBeep()) {
+    buddyAudioPlayCompletionBeep();
+  }
+}
+
+static void buddyAudioPowerDown() {
+  buddyAudioSetMute(true);
+  if (BUDDY_AUDIO_PA_CTRL >= 0) digitalWrite(BUDDY_AUDIO_PA_CTRL, LOW);
+  buddyAudioDisableI2S();
+}
+#else
+static void buddyAudioPoll() {
+  consumeTaskCompleteBeep();
+}
+
+static void buddyAudioPowerDown() {
+}
+#endif
 
 // --- BLE Callbacks ---
 class ServerCallbacks : public BLEServerCallbacks {
@@ -936,6 +1219,7 @@ class CharCallbacks : public BLECharacteristicCallbacks {
       if (idLen > BUDDY_TASK_ID_MAX) idLen = BUDDY_TASK_ID_MAX;
 
       bool isClear = (flags & 0x07) == 0;
+      bool shouldQueueCompleteBeep = !isClear && (flags & 0x02) != 0 && (flags & 0x04) == 0;
       char localTaskRunId[BUDDY_TASK_ID_MAX + 1] = {0};
       unsigned long now_taskrun = millis();
       portENTER_CRITICAL(&bleMux);
@@ -962,6 +1246,9 @@ class CharCallbacks : public BLECharacteristicCallbacks {
       lastBleData = now_taskrun;
       portEXIT_CRITICAL(&bleMux);
 
+      if (shouldQueueCompleteBeep) {
+        queueTaskCompleteBeep(sessionKey, seq);
+      }
       infoDirty = true;
       Serial.printf("[BLE] TaskRun: flags=0x%02X elapsed=%us seq=%u key=%u id=\"%s\"\n",
         flags, elapsed, seq, sessionKey, localTaskRunId);
@@ -1553,6 +1840,11 @@ void setup() {
 #if BUDDY_POWER_HOLD_PIN >= 0
   Serial.printf("[PWR]  Hold pin GPIO%d set HIGH\n", BUDDY_POWER_HOLD_PIN);
 #endif
+#if BUDDY_AUDIO_ENABLED
+  pinMode(BUDDY_AUDIO_PA_CTRL, OUTPUT);
+  digitalWrite(BUDDY_AUDIO_PA_CTRL, LOW);
+  Serial.printf("[AUDIO] PA GPIO%d held LOW until task-complete cue\n", BUDDY_AUDIO_PA_CTRL);
+#endif
 
   // NVS — restore persisted settings
   prefs.begin("buddy", false);
@@ -1688,6 +1980,7 @@ void loop() {
       buddyOrientationStr(localOrientation),
       tftRotationForBuddyOrientation(localOrientation));
   }
+  buddyAudioPoll();
 
   // Frame rate limiter
   bool isSleepy = (appMode == MODE_DEMO && currentScene == SCENE_SLEEP)

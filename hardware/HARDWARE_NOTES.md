@@ -22,6 +22,14 @@
 - `BTN  = GPIO4`（板载 `PLUS` 键，`INPUT_PULLUP`）
 - `BAT_EN = GPIO2`（电池供电保持，高电平）
 - `PWR  = GPIO5`（板载 `PWR` 键，运行中长按关机）
+- 音频 Codec/功放：
+  - `PA_CTRL = GPIO7`
+  - `I2S_MCLK = GPIO8`
+  - `I2S_BCLK = GPIO9`
+  - `I2S_DOUT = GPIO12`
+  - `I2S_LRC  = GPIO10`
+  - `I2C_SDA  = GPIO42`
+  - `I2C_SCL  = GPIO41`
 - 默认 `LCD_ROT = 2`，整体显示相对原厂示例旋转 180 度
 
 > 说明：这些是板载屏幕连接，通常不建议改动。
@@ -104,6 +112,14 @@ Buddy 的电池供电策略：
 - 运行中长按 `PWR/GPIO5` 约 1.5 秒，固件拉低 `BAT_EN/GPIO2` 关机。
 - 短按 `PWR` 不做唤醒；屏幕息屏后仍由 BLE 状态或 `PLUS` 业务键唤醒。
 - USB 供电时拉低 `BAT_EN` 不一定会断电，因为 USB 仍在供电。
+
+Buddy 的任务完成提示音策略：
+
+- S3 profile 使用板载 ES8311 codec + NS4150B 功放播放短提示音。
+- Mac 端发送 `0xEF` TaskRun 帧且 flags bit1 为 completed 时，固件排队播放一声提示。
+- failed 帧不播放完成提示音。
+- 同一个 `sessionKey + seq` 的 completed 帧只响一次，避免 BLE 重发导致重复提示。
+- 功放 `PA_CTRL/GPIO7` 默认保持低电平，只有播放提示音时短暂拉高，降低电池空耗。
 
 ## 6) 最小自检顺序（推荐每次新工程先跑）
 
