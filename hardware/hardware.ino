@@ -111,9 +111,9 @@
 
 // --- Audio cue (ESP32-S3-LCD-1.54: ES8311 codec + NS4150B PA) ---
 #define BUDDY_AUDIO_SAMPLE_RATE 16000
-#define BUDDY_AUDIO_VOLUME 65
-#define BUDDY_AUDIO_BEEP_HZ 1760.0f
-#define BUDDY_AUDIO_BEEP_MS 130
+#define BUDDY_AUDIO_VOLUME 90
+#define BUDDY_AUDIO_BEEP_HZ 1568.0f
+#define BUDDY_AUDIO_BEEP_MS 300
 #define BUDDY_AUDIO_COOLDOWN_MS 250UL
 
 // --- Backlight PWM (reduce heat) ---
@@ -715,14 +715,24 @@ static bool buddyAudioWriteReg(uint8_t reg, uint8_t value) {
   Wire.beginTransmission(0x18);
   Wire.write(reg);
   Wire.write(value);
-  return Wire.endTransmission() == 0;
+  bool ok = Wire.endTransmission() == 0;
+  if (!ok) {
+    Serial.printf("[AUDIO] ES8311 write reg 0x%02X failed\n", reg);
+  }
+  return ok;
 }
 
 static bool buddyAudioReadReg(uint8_t reg, uint8_t* value) {
   Wire.beginTransmission(0x18);
   Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom(0x18, 1) != 1) return false;
+  if (Wire.endTransmission(false) != 0) {
+    Serial.printf("[AUDIO] ES8311 read reg 0x%02X address phase failed\n", reg);
+    return false;
+  }
+  if (Wire.requestFrom(0x18, 1) != 1) {
+    Serial.printf("[AUDIO] ES8311 read reg 0x%02X data phase failed\n", reg);
+    return false;
+  }
   *value = Wire.read();
   return true;
 }
@@ -839,7 +849,6 @@ static bool buddyAudioEnsureReady() {
   if (!buddyAudioEnsureI2S() || !buddyAudioEnableI2S()) return false;
   delay(10);
   buddyAudioReady = buddyAudioCodecInit();
-  buddyAudioDisableI2S();
 
   if (!buddyAudioReady) {
     Serial.println("[AUDIO] ES8311 init failed");
@@ -857,7 +866,11 @@ static void buddyAudioWriteSilence(uint16_t frames) {
   while (frames > 0) {
     uint16_t chunk = min((uint16_t)64, frames);
     size_t written = 0;
-    i2s_channel_write(buddyAudioTx, silence, chunk * 2 * sizeof(int16_t), &written, 100);
+    esp_err_t err = i2s_channel_write(buddyAudioTx, silence, chunk * 2 * sizeof(int16_t), &written, 100);
+    if (err != ESP_OK) {
+      Serial.printf("[AUDIO] I2S silence write failed: %d\n", err);
+      return;
+    }
     frames -= chunk;
   }
 }
@@ -871,7 +884,7 @@ static void buddyAudioPlayCompletionBeep() {
 
   buddyAudioWriteSilence(32);
   digitalWrite(BUDDY_AUDIO_PA_CTRL, HIGH);
-  delay(4);
+  delay(80);
   buddyAudioSetMute(false);
 
   const int totalFrames = (BUDDY_AUDIO_SAMPLE_RATE * BUDDY_AUDIO_BEEP_MS) / 1000;
@@ -895,7 +908,11 @@ static void buddyAudioPlayCompletionBeep() {
       if (phase > 2.0f * 3.14159265f) phase -= 2.0f * 3.14159265f;
     }
     size_t written = 0;
-    i2s_channel_write(buddyAudioTx, samples, chunk * 2 * sizeof(int16_t), &written, 100);
+    esp_err_t err = i2s_channel_write(buddyAudioTx, samples, chunk * 2 * sizeof(int16_t), &written, 100);
+    if (err != ESP_OK) {
+      Serial.printf("[AUDIO] I2S beep write failed: %d\n", err);
+      break;
+    }
     frame += chunk;
   }
 
@@ -903,7 +920,6 @@ static void buddyAudioPlayCompletionBeep() {
   buddyAudioSetMute(true);
   delay(2);
   digitalWrite(BUDDY_AUDIO_PA_CTRL, LOW);
-  buddyAudioDisableI2S();
   Serial.println("[AUDIO] Task complete beep played");
 }
 
