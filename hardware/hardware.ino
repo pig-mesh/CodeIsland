@@ -41,9 +41,12 @@
 #define TFT_BL   46
 #define BTN_PIN  4
 #define BTN_LABEL "PLUS"
+#define BUDDY_BOOT_BUTTON_PIN 0
+#define BUDDY_BOOT_BUTTON_LABEL "BOOT"
 #define BUDDY_POWER_HOLD_PIN 2
 #define BUDDY_POWER_BUTTON_PIN 5
 #define BUDDY_POWER_BUTTON_LABEL "PWR"
+#define BUDDY_BATTERY_ADC_PIN 1
 #define BUDDY_AUDIO_ENABLED 1
 #define BUDDY_AUDIO_PA_CTRL 7
 #define BUDDY_AUDIO_MCLK 8
@@ -67,9 +70,12 @@
 #define TFT_BL   22
 #define BTN_PIN  9
 #define BTN_LABEL "BOOT"
+#define BUDDY_BOOT_BUTTON_PIN -1
+#define BUDDY_BOOT_BUTTON_LABEL "BOOT"
 #define BUDDY_POWER_HOLD_PIN -1
 #define BUDDY_POWER_BUTTON_PIN -1
 #define BUDDY_POWER_BUTTON_LABEL "PWR"
+#define BUDDY_BATTERY_ADC_PIN -1
 #define BUDDY_AUDIO_ENABLED 0
 #define BUDDY_AUDIO_PA_CTRL -1
 #define BUDDY_AUDIO_MCLK -1
@@ -111,7 +117,7 @@
 
 // --- Audio cue (ESP32-S3-LCD-1.54: ES8311 codec + NS4150B PA) ---
 #define BUDDY_AUDIO_SAMPLE_RATE 16000
-#define BUDDY_AUDIO_VOLUME 45
+#define BUDDY_AUDIO_VOLUME 60
 #define BUDDY_AUDIO_BEEP_HZ 1568.0f
 #define BUDDY_AUDIO_BEEP_MS 300
 #define BUDDY_AUDIO_COOLDOWN_MS 250UL
@@ -126,6 +132,14 @@
 #define BL_SLEEP_AFTER_MS 30000UL
 #define SCREEN_OFF_TIMEOUT_MS 300000UL
 #define BL_SLEEP_PERCENT 15
+
+// --- Battery sense (ESP32-S3-LCD-1.54: VBAT -> 200K/100K divider -> GPIO1) ---
+#define BUDDY_BATTERY_SAMPLE_INTERVAL_MS 5000UL
+#define BUDDY_BATTERY_VOLTAGE_SCALE 3.0f
+#define BUDDY_BATTERY_EMPTY_MV 3300UL
+#define BUDDY_BATTERY_FULL_MV 4200UL
+#define BUDDY_BATTERY_LOW_PERCENT 30
+#define BUDDY_BATTERY_WARN_PERCENT 50
 
 // --- Frame rate control ---
 #define FPS_ACTIVE  25
@@ -153,6 +167,8 @@ static char bleDeviceName[BLE_DEVICE_NAME_LEN] = "Buddy";
 #define BUDDY_BRIGHTNESS_MIN_PERCENT    10
 #define BUDDY_BRIGHTNESS_MAX_PERCENT    100
 #define BUDDY_BRIGHTNESS_DEFAULT_PERCENT 70
+#define BUDDY_BRIGHTNESS_BUTTON_STEP_PERCENT 5
+#define BUDDY_BRIGHTNESS_BUTTON_REPEAT_MS 120UL
 #define BUDDY_SCREEN_UP                 0
 #define BUDDY_SCREEN_DOWN               1
 #define BUDDY_TASK_RUN_FRAME            0xEF
@@ -301,6 +317,11 @@ unsigned long lastNvsSave = 0;
 volatile bool nvsDirty = false;
 #define NVS_DEBOUNCE_MS 5000
 
+// --- Battery state ---
+int16_t batteryPercent = -1;
+uint32_t batteryVoltageMv = 0;
+unsigned long lastBatterySample = 0;
+
 #ifdef BUDDY_OTA_ENABLED
 // --- OTA state ---
 bool otaEnabled = false;
@@ -443,6 +464,21 @@ bool statusKeepsScreenAwake(uint8_t status) {
   return status == 1 || status == 2 || status == 3 || status == 4;
 }
 
+void wakeScreen(const char* reason, unsigned long now) {
+  unsigned long previousWake = 0;
+  AppMode localMode = MODE_ONBOARD;
+  portENTER_CRITICAL(&bleMux);
+  previousWake = lastWakeActivity;
+  lastWakeActivity = now;
+  localMode = appMode;
+  portEXIT_CRITICAL(&bleMux);
+
+  if ((localMode == MODE_AGENT || localMode == MODE_PAIR_CONFIRM) &&
+      (now - previousWake) >= BL_SLEEP_AFTER_MS) {
+    Serial.printf("[WAKE] Soft wake: %s (idle=%lus)\n", reason, (now - previousWake) / 1000);
+  }
+}
+
 // --- Task-run slot management (call with bleMux held) ---
 
 void clearAllTaskRunSlotsLocked() {
@@ -540,6 +576,50 @@ uint8_t idleBrightness() {
   return scaledBrightness(BL_BRIGHT_IDLE);
 }
 
+void setBuddyBrightnessLocal(uint8_t percent, const char* reason, unsigned long now) {
+  uint8_t clamped = clampBuddyBrightness(percent);
+  bool changed = false;
+  portENTER_CRITICAL(&bleMux);
+  if (buddyBrightnessPercent != clamped) {
+    buddyBrightnessPercent = clamped;
+    changed = true;
+  }
+  portEXIT_CRITICAL(&bleMux);
+
+  if (changed) {
+    lastInteraction = now;
+    wakeScreen(reason, now);
+    currentBrightness = activeBrightness();
+    ledcWrite(TFT_BL, currentBrightness);
+    Serial.printf("[BOOT] Brightness local: %d%% pwm=%d\n", clamped, currentBrightness);
+  }
+}
+
+int16_t batteryPercentFromVoltage(uint32_t voltageMv) {
+  if (voltageMv <= BUDDY_BATTERY_EMPTY_MV) return 0;
+  if (voltageMv >= BUDDY_BATTERY_FULL_MV) return 100;
+  return (int16_t)((voltageMv - BUDDY_BATTERY_EMPTY_MV) * 100UL /
+                   (BUDDY_BATTERY_FULL_MV - BUDDY_BATTERY_EMPTY_MV));
+}
+
+void updateBatterySample(unsigned long now) {
+#if BUDDY_BATTERY_ADC_PIN >= 0
+  if (batteryPercent >= 0 && (now - lastBatterySample) < BUDDY_BATTERY_SAMPLE_INTERVAL_MS) {
+    return;
+  }
+
+  uint32_t adcMv = analogReadMilliVolts(BUDDY_BATTERY_ADC_PIN);
+  uint32_t vbatMv = (uint32_t)(adcMv * BUDDY_BATTERY_VOLTAGE_SCALE + 0.5f);
+  batteryVoltageMv = vbatMv;
+  batteryPercent = batteryPercentFromVoltage(vbatMv);
+  lastBatterySample = now;
+  Serial.printf("[BAT]  GPIO%d adc=%lumV vbat=%lumV percent=%d%%\n",
+    BUDDY_BATTERY_ADC_PIN, (unsigned long)adcMv, (unsigned long)vbatMv, batteryPercent);
+#else
+  (void)now;
+#endif
+}
+
 void drawCenteredText(const char* text, int y, uint8_t textSize, uint16_t color) {
   gfx->setTextSize(textSize);
   gfx->setTextColor(color);
@@ -584,6 +664,109 @@ int pollButton(unsigned long now) {
   if (btnStable == LOW) { btnPressed = true; btnLongFired = false; btnPressStart = now; return 0; }
   btnPressed = false;
   return btnLongFired ? 0 : 1;
+}
+
+// --- BOOT brightness button state (S3 profile) ---
+bool   bootStable = HIGH;
+bool   bootLastRead = HIGH;
+unsigned long bootLastChange = 0;
+unsigned long bootPressStart = 0;
+unsigned long bootLastStep = 0;
+bool   bootPressed = false;
+bool   bootAdjustingBrightness = false;
+bool   bootBrightnessChanged = false;
+int8_t bootBrightnessDirection = 1;
+
+uint8_t currentBuddyBrightnessPercent() {
+  portENTER_CRITICAL(&bleMux);
+  uint8_t percent = buddyBrightnessPercent;
+  portEXIT_CRITICAL(&bleMux);
+  return percent;
+}
+
+void markBuddyBrightnessDirty() {
+  portENTER_CRITICAL(&bleMux);
+  nvsDirty = true;
+  portEXIT_CRITICAL(&bleMux);
+}
+
+void prepareBootBrightnessDirection() {
+  bootBrightnessDirection = currentBuddyBrightnessPercent() >= BUDDY_BRIGHTNESS_MAX_PERCENT ? -1 : 1;
+}
+
+void stepBootBrightness(unsigned long now) {
+  uint8_t current = currentBuddyBrightnessPercent();
+  uint8_t next = current;
+
+  if (bootBrightnessDirection > 0) {
+    if (current >= BUDDY_BRIGHTNESS_MAX_PERCENT) {
+      bootBrightnessDirection = -1;
+      next = BUDDY_BRIGHTNESS_MAX_PERCENT - BUDDY_BRIGHTNESS_BUTTON_STEP_PERCENT;
+    } else {
+      next = (uint8_t)min((int)BUDDY_BRIGHTNESS_MAX_PERCENT,
+                         (int)current + BUDDY_BRIGHTNESS_BUTTON_STEP_PERCENT);
+      if (next >= BUDDY_BRIGHTNESS_MAX_PERCENT) bootBrightnessDirection = -1;
+    }
+  } else {
+    if (current <= BUDDY_BRIGHTNESS_MIN_PERCENT) {
+      bootBrightnessDirection = 1;
+      next = BUDDY_BRIGHTNESS_MIN_PERCENT + BUDDY_BRIGHTNESS_BUTTON_STEP_PERCENT;
+    } else {
+      next = (uint8_t)max((int)BUDDY_BRIGHTNESS_MIN_PERCENT,
+                         (int)current - BUDDY_BRIGHTNESS_BUTTON_STEP_PERCENT);
+      if (next <= BUDDY_BRIGHTNESS_MIN_PERCENT) bootBrightnessDirection = 1;
+    }
+  }
+
+  setBuddyBrightnessLocal(next, "boot brightness", now);
+  bootBrightnessChanged = true;
+  bootLastStep = now;
+}
+
+void pollBootBrightnessButton(unsigned long now) {
+#if BUDDY_BOOT_BUTTON_PIN >= 0
+  bool raw = digitalRead(BUDDY_BOOT_BUTTON_PIN);
+  if (raw != bootLastRead) { bootLastRead = raw; bootLastChange = now; }
+  if ((now - bootLastChange) < DEBOUNCE_MS) return;
+
+  if (bootStable == bootLastRead) {
+    if (bootPressed && !bootAdjustingBrightness && (now - bootPressStart) >= LONG_PRESS_MS) {
+      bootAdjustingBrightness = true;
+      Serial.println("[BOOT] Long press -> brightness adjust");
+      stepBootBrightness(now);
+    } else if (bootPressed && bootAdjustingBrightness &&
+               (now - bootLastStep) >= BUDDY_BRIGHTNESS_BUTTON_REPEAT_MS) {
+      stepBootBrightness(now);
+    }
+    return;
+  }
+
+  bootStable = bootLastRead;
+  if (bootStable == LOW) {
+    bootPressed = true;
+    bootAdjustingBrightness = false;
+    bootBrightnessChanged = false;
+    bootPressStart = now;
+    bootLastStep = now;
+    prepareBootBrightnessDirection();
+    Serial.printf("[BOOT] Press detected on GPIO%d\n", BUDDY_BOOT_BUTTON_PIN);
+    return;
+  }
+
+  if (bootAdjustingBrightness && bootBrightnessChanged) {
+    markBuddyBrightnessDirty();
+    lastInteraction = now;
+    Serial.printf("[BOOT] Brightness saved: %d%%\n", currentBuddyBrightnessPercent());
+  } else {
+    Serial.println("[BOOT] Short press ignored");
+  }
+  Serial.printf("[BOOT] Released on GPIO%d\n", BUDDY_BOOT_BUTTON_PIN);
+  bootPressed = false;
+  bootAdjustingBrightness = false;
+  bootBrightnessChanged = false;
+#else
+  (void)now;
+#endif
 }
 
 // --- Power button state (S3 battery profile) ---
@@ -1025,21 +1208,25 @@ class CharCallbacks : public BLECharacteristicCallbacks {
       portEXIT_CRITICAL(&bleMux);
 
       if (hostMatch) {
+        unsigned long now_pair = millis();
         portENTER_CRITICAL(&bleMux);
         pairAuthenticated = true;
         hasEverConnected = true;
         appMode = MODE_AGENT;
-        lastBleData = millis();
+        lastBleData = now_pair;
         portEXIT_CRITICAL(&bleMux);
         sendPairNotify(PAIR_ACCEPTED_MARKER);
+        wakeScreen("pair accepted", now_pair);
         Serial.println("[PAIR] Accepted (known host)");
       } else if (!localIsPaired && !alreadyConfirming) {
+        unsigned long now_pair = millis();
         portENTER_CRITICAL(&bleMux);
         memcpy(pendingHostId, incomingId, HOST_ID_LENGTH);
-        pairRequestTime = millis();
+        pairRequestTime = now_pair;
         appMode = MODE_PAIR_CONFIRM;
         portEXIT_CRITICAL(&bleMux);
         sendPairNotify(PAIR_PENDING_MARKER);
+        wakeScreen("pair pending", now_pair);
         Serial.println("[PAIR] Pending — waiting for button confirmation");
       } else if (!localIsPaired && alreadyConfirming) {
         sendPairNotify(PAIR_REJECTED_MARKER);
@@ -1188,11 +1375,15 @@ class CharCallbacks : public BLECharacteristicCallbacks {
     // Event frame (0xF7) — transient animations
     if (len >= 2 && data[0] == 0xF7) {
       uint8_t eventId = data[1];
+      unsigned long now_event = millis();
       portENTER_CRITICAL(&bleMux);
-      lastBleData = millis();
-      if (eventId == 1) { pendingAnim = ANIM_CELEBRATE; animStartTime = millis(); }
-      else if (eventId == 2) { pendingAnim = ANIM_FRUSTRATED; animStartTime = millis(); }
+      lastBleData = now_event;
+      if (eventId == 1) { pendingAnim = ANIM_CELEBRATE; animStartTime = now_event; }
+      else if (eventId == 2) { pendingAnim = ANIM_FRUSTRATED; animStartTime = now_event; }
       portEXIT_CRITICAL(&bleMux);
+      if (eventId == 1) wakeScreen("event complete", now_event);
+      else if (eventId == 2) wakeScreen("event error", now_event);
+      else if (eventId == 3) wakeScreen("event approval", now_event);
       Serial.printf("[BLE] Event: %d\n", eventId);
       return;
     }
@@ -1235,6 +1426,7 @@ class CharCallbacks : public BLECharacteristicCallbacks {
       if (idLen > BUDDY_TASK_ID_MAX) idLen = BUDDY_TASK_ID_MAX;
 
       bool isClear = (flags & 0x07) == 0;
+      bool isActiveTaskRun = !isClear && (flags & 0x01) != 0;
       bool shouldQueueCompleteBeep = !isClear && (flags & 0x02) != 0 && (flags & 0x04) == 0;
       char localTaskRunId[BUDDY_TASK_ID_MAX + 1] = {0};
       unsigned long now_taskrun = millis();
@@ -1262,6 +1454,9 @@ class CharCallbacks : public BLECharacteristicCallbacks {
       lastBleData = now_taskrun;
       portEXIT_CRITICAL(&bleMux);
 
+      if (isActiveTaskRun) {
+        wakeScreen("task-run active", now_taskrun);
+      }
       if (shouldQueueCompleteBeep) {
         queueTaskCompleteBeep(sessionKey, seq);
       }
@@ -1366,6 +1561,7 @@ class CharCallbacks : public BLECharacteristicCallbacks {
       memcpy(nextToolName, data + 3, toolLen);
     }
     nextToolName[toolLen] = '\0';
+    bool shouldWakeForStatus = statusKeepsScreenAwake(nextStatusId);
 
     portENTER_CRITICAL(&bleMux);
     if (bleSourceId != nextSourceId) headerDirty = true;
@@ -1375,9 +1571,6 @@ class CharCallbacks : public BLECharacteristicCallbacks {
     // session; Mac sends a per-session clear/completed frame when a run ends.
     bleSourceId = nextSourceId;
     bleStatusId = nextStatusId;
-    if (statusKeepsScreenAwake(bleStatusId)) {
-      lastWakeActivity = now_write;
-    }
     memset(bleToolName, 0, sizeof(bleToolName));
     memcpy(bleToolName, nextToolName, sizeof(bleToolName) - 1);
     lastBleData = now_write;
@@ -1388,6 +1581,9 @@ class CharCallbacks : public BLECharacteristicCallbacks {
     lastBleWriteTime = now_write;
     portEXIT_CRITICAL(&bleMux);
 
+    if (shouldWakeForStatus) {
+      wakeScreen("status active", now_write);
+    }
     const char* srcName = (bleSourceId < NUM_MASCOTS) ? mascots[bleSourceId].name : "?";
     Serial.printf("[BLE] Parsed: source=%d(%s) status=%d(%s) tool=\"%s\"\n",
       bleSourceId, srcName, bleStatusId, statusStr(bleStatusId), bleToolName);
@@ -1765,7 +1961,7 @@ void drawFrustrated(float t, uint8_t mascotIdx, unsigned long animationStartTime
 
 // --- Draw connection status ---
 void drawStatusBar() {
-  uint16_t col = bleConnected ? RGB565(50, 230, 50) : RGB565(100, 100, 100);
+  uint16_t col = bleConnected ? RGB565(0, 122, 255) : RGB565(100, 100, 100);
   gfx->fillRect(LCD_W / 2 - 3, 0, 6, 3, col);
   if (appMode == MODE_DEMO) {
     gfx->setTextColor(RGB565(60, 60, 70));
@@ -1773,6 +1969,25 @@ void drawStatusBar() {
     gfx->setCursor(2, 0);
     gfx->print("DEMO");
   }
+}
+
+void drawBatteryStatusLight() {
+#if BUDDY_BATTERY_ADC_PIN >= 0
+  if (batteryPercent < 0) return;
+
+  uint16_t col = RGB565(52, 215, 89);
+  if (batteryPercent < BUDDY_BATTERY_LOW_PERCENT) {
+    col = RGB565(255, 69, 58);
+  } else if (batteryPercent < BUDDY_BATTERY_WARN_PERCENT) {
+    col = RGB565(255, 210, 63);
+  }
+
+  const int16_t cx = LCD_W - 12;
+  const int16_t cy = 12;
+  gfx->fillCircle(cx, cy, 6, RGB565(0, 0, 0));
+  gfx->fillCircle(cx, cy, 5, RGB565(22, 24, 30));
+  gfx->fillCircle(cx, cy, 4, col);
+#endif
 }
 
 // --- Draw pair confirmation screen ---
@@ -1815,7 +2030,6 @@ void drawOnboardScreen(float t) {
   drawCodeIslandQR(qrX, qrY, ONBOARD_QR_SCALE);
 
   int y = qrY + qrPixels + (UI_COMPACT ? 10 : 16);
-  drawCenteredText("Open CodeIsland", y, 1, RGB565(170, 170, 190));
   drawCenteredText("Settings > Buddy", y + (UI_COMPACT ? 12 : 14), 1, RGB565(120, 200, 255));
   drawCenteredText("Connect by Bluetooth", y + (UI_COMPACT ? 24 : 28), 1, RGB565(130, 130, 150));
 
@@ -1891,6 +2105,14 @@ void setup() {
   Serial.printf("[BOOT] Flash: %d KB  Speed: %d MHz\n",
     ESP.getFlashChipSize() / 1024, ESP.getFlashChipSpeed() / 1000000);
 
+#if BUDDY_BATTERY_ADC_PIN >= 0
+  analogReadResolution(12);
+  analogSetPinAttenuation(BUDDY_BATTERY_ADC_PIN, ADC_11db);
+  Serial.printf("[BAT]  ADC GPIO%d initialized (scale=%.1f, empty=%lumV full=%lumV)\n",
+    BUDDY_BATTERY_ADC_PIN, BUDDY_BATTERY_VOLTAGE_SCALE,
+    (unsigned long)BUDDY_BATTERY_EMPTY_MV, (unsigned long)BUDDY_BATTERY_FULL_MV);
+#endif
+
   // LCD — PWM backlight for heat reduction
   Serial.println("[LCD]  Initializing...");
   Serial.printf("[LCD]  Pins: MOSI=%d SCLK=%d CS=%d DC=%d RST=%d BL=%d\n",
@@ -1905,6 +2127,11 @@ void setup() {
     BL_PWM_FREQ, BL_PWM_BITS, currentBrightness, buddyBrightnessPercent);
   pinMode(BTN_PIN, INPUT_PULLUP);
   Serial.printf("[BTN]  %s Pin=%d (INPUT_PULLUP)\n", BTN_LABEL, BTN_PIN);
+#if BUDDY_BOOT_BUTTON_PIN >= 0
+  pinMode(BUDDY_BOOT_BUTTON_PIN, INPUT_PULLUP);
+  Serial.printf("[BOOT] %s Pin=%d (INPUT_PULLUP, long-press brightness)\n",
+    BUDDY_BOOT_BUTTON_LABEL, BUDDY_BOOT_BUTTON_PIN);
+#endif
 #if BUDDY_POWER_BUTTON_PIN >= 0
   pinMode(BUDDY_POWER_BUTTON_PIN, INPUT_PULLUP);
   Serial.printf("[PWR]  %s Pin=%d (INPUT_PULLUP, long-press power off)\n",
@@ -1997,6 +2224,7 @@ void loop() {
       tftRotationForBuddyOrientation(localOrientation));
   }
   buddyAudioPoll();
+  pollBootBrightnessButton(now);
 
   // Frame rate limiter
   bool isSleepy = (appMode == MODE_DEMO && currentScene == SCENE_SLEEP)
@@ -2017,6 +2245,8 @@ void loop() {
     frameCount = 0;
     lastFpsCalcTime = now;
   }
+
+  updateBatterySample(now);
 
   float t = now / 1000.0f;
 
@@ -2073,6 +2303,7 @@ void loop() {
       lastBleData = now;
       portEXIT_CRITICAL(&bleMux);
       sendPairNotify(PAIR_ACCEPTED_MARKER);
+      wakeScreen("pair accepted", now);
       lastInteraction = now;
       Serial.println("[BTN]  Pairing accepted");
     } else if (btn == 2) {
@@ -2362,6 +2593,7 @@ void loop() {
     }
   }
 
+  drawBatteryStatusLight();
   tft.drawRGBBitmap(0, 0, canvas.getBuffer(), LCD_W, LCD_H);
   }
 
