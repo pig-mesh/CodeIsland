@@ -2258,7 +2258,9 @@ void loop() {
     return;
   }
   if (pwrBtn == 1) {
-    Serial.println("[PWR]  Short press ignored");
+    lastInteraction = now;
+    wakeScreen("pwr short press", now);
+    Serial.println("[PWR]  Short press -> wake screen");
   }
   if (btn != 0) {
     lastWakeActivity = now;
