@@ -21,7 +21,7 @@ This app follows the same contract as `Sources/CodeIslandCore/ESP32Protocol.swif
 - Notify char: `0000beef-0002-1000-8000-00805f9b34fb`
 - Agent frame: `sourceId + statusId + toolLen + toolName`
 - Brightness frame: `0xFE + percent`
-- Orientation frame: `0xFD + orientation`
+- Orientation frame: `0xFD + orientation` where `0=360/default`, `1=180`, `2=90`, `3=270`
 
 ## Requirements
 

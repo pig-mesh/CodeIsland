@@ -1,12 +1,14 @@
 package com.codeisland.buddywatch
 
-enum class ScreenOrientation(val wireValue: Int) {
-    UP(0),
-    DOWN(1);
+enum class ScreenOrientation(val wireValue: Int, val rotationDegrees: Float) {
+    DEGREES_360(0, 0f),
+    DEGREES_180(1, 180f),
+    DEGREES_90(2, 90f),
+    DEGREES_270(3, 270f);
 
     companion object {
         fun fromWireValue(value: Int): ScreenOrientation {
-            return if (value == DOWN.wireValue) DOWN else UP
+            return entries.firstOrNull { it.wireValue == value } ?: DEGREES_360
         }
     }
 }
@@ -86,7 +88,7 @@ data class BuddyUiState(
     val messages: List<WatchMessagePreview> = emptyList(),
     val selectedMessageSlot: Int = 0,
     val brightnessPercent: Int = BleProtocol.defaultBrightnessPercent,
-    val orientation: ScreenOrientation = ScreenOrientation.UP,
+    val orientation: ScreenOrientation = ScreenOrientation.DEGREES_360,
     val connectedDeviceName: String? = null,
     val focusPulseToken: Long = 0,
     val errorMessage: String? = null,

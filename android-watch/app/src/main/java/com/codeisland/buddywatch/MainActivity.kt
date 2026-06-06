@@ -246,7 +246,7 @@ class MainActivity : ComponentActivity() {
         val aggregateWaitingDetail = aggregateWaitingDetail(state)
         val showWaitingDetail = aggregateWaitingDetail != null
 
-        binding.rootContainer.rotation = if (state.orientation == ScreenOrientation.DOWN) 180f else 0f
+        binding.rootContainer.rotation = state.orientation.rotationDegrees
         applyBrightness(state.brightnessPercent)
 
         binding.statusIndicator.backgroundTintList = ColorStateList.valueOf(statusIndicatorColor(state))

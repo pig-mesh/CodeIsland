@@ -21,7 +21,7 @@
 - Notify Characteristic：`0000beef-0002-1000-8000-00805f9b34fb`
 - Agent 帧：`sourceId + statusId + toolLen + toolName`
 - 亮度帧：`0xFE + percent`
-- 方向帧：`0xFD + orientation`
+- 方向帧：`0xFD + orientation`，其中 `0=360°/默认`、`1=180°`、`2=90°`、`3=270°`
 
 ## 环境要求
 

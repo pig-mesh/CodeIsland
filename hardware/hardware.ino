@@ -164,13 +164,22 @@ static char bleDeviceName[BLE_DEVICE_NAME_LEN] = "Buddy";
 // --- Buddy config frames ---
 #define BUDDY_BRIGHTNESS_FRAME          0xFE
 #define BUDDY_ORIENTATION_FRAME         0xFD
+#define BUDDY_VOLUME_FRAME              0xEE
+#define BUDDY_BATTERY_FRAME             0xED
 #define BUDDY_BRIGHTNESS_MIN_PERCENT    10
 #define BUDDY_BRIGHTNESS_MAX_PERCENT    100
 #define BUDDY_BRIGHTNESS_DEFAULT_PERCENT 70
+#define BUDDY_VOLUME_MIN_PERCENT        0
+#define BUDDY_VOLUME_MAX_PERCENT        100
+#define BUDDY_VOLUME_DEFAULT_PERCENT    BUDDY_AUDIO_VOLUME
 #define BUDDY_BRIGHTNESS_BUTTON_STEP_PERCENT 5
 #define BUDDY_BRIGHTNESS_BUTTON_REPEAT_MS 120UL
-#define BUDDY_SCREEN_UP                 0
-#define BUDDY_SCREEN_DOWN               1
+#define BUDDY_SCREEN_ROTATION_360       0
+#define BUDDY_SCREEN_ROTATION_180       1
+#define BUDDY_SCREEN_ROTATION_90        2
+#define BUDDY_SCREEN_ROTATION_270       3
+#define BUDDY_SCREEN_UP                 BUDDY_SCREEN_ROTATION_360
+#define BUDDY_SCREEN_DOWN               BUDDY_SCREEN_ROTATION_180
 #define BUDDY_TASK_RUN_FRAME            0xEF
 #define BUDDY_TASK_ID_MAX               9
 #define BUDDY_TASK_RUN_SLOTS            4
@@ -252,6 +261,7 @@ TaskRunSlot       taskRunSlots[BUDDY_TASK_RUN_SLOTS];
 uint16_t          taskRunDisplayKey = 0;  // 当前应显示的 session（最近收到帧者）
 volatile uint8_t  buddyBrightnessPercent = BUDDY_BRIGHTNESS_DEFAULT_PERCENT;
 volatile uint8_t  buddyScreenOrientation = BUDDY_SCREEN_UP;
+volatile uint8_t  buddySpeakerVolumePercent = BUDDY_VOLUME_DEFAULT_PERCENT;
 volatile bool     buddyOrientationDirty = false;
 char              bleToolName[18] = {0};
 char              bleWorkspaceName[20] = {0};
@@ -321,6 +331,7 @@ volatile bool nvsDirty = false;
 int16_t batteryPercent = -1;
 uint32_t batteryVoltageMv = 0;
 unsigned long lastBatterySample = 0;
+int16_t lastBatteryNotifyPercent = -1;
 
 #ifdef BUDDY_OTA_ENABLED
 // --- OTA state ---
@@ -536,16 +547,51 @@ uint8_t clampBuddyBrightness(uint8_t percent) {
   return percent;
 }
 
+uint8_t clampBuddyVolume(uint8_t percent) {
+  if (percent < BUDDY_VOLUME_MIN_PERCENT) return BUDDY_VOLUME_MIN_PERCENT;
+  if (percent > BUDDY_VOLUME_MAX_PERCENT) return BUDDY_VOLUME_MAX_PERCENT;
+  return percent;
+}
+
+uint8_t currentBuddySpeakerVolumePercent() {
+  portENTER_CRITICAL(&bleMux);
+  uint8_t percent = buddySpeakerVolumePercent;
+  portEXIT_CRITICAL(&bleMux);
+  return percent;
+}
+
 uint8_t clampBuddyOrientation(uint8_t orientation) {
-  return orientation == BUDDY_SCREEN_DOWN ? BUDDY_SCREEN_DOWN : BUDDY_SCREEN_UP;
+  switch (orientation) {
+    case BUDDY_SCREEN_ROTATION_90:
+    case BUDDY_SCREEN_ROTATION_180:
+    case BUDDY_SCREEN_ROTATION_270:
+    case BUDDY_SCREEN_ROTATION_360:
+      return orientation;
+    default:
+      return BUDDY_SCREEN_ROTATION_360;
+  }
 }
 
 uint8_t tftRotationForBuddyOrientation(uint8_t orientation) {
-  return orientation == BUDDY_SCREEN_DOWN ? (uint8_t)((LCD_ROT + 2) % 4) : LCD_ROT;
+  switch (clampBuddyOrientation(orientation)) {
+    case BUDDY_SCREEN_ROTATION_90:
+      return (uint8_t)((LCD_ROT + 1) % 4);
+    case BUDDY_SCREEN_ROTATION_180:
+      return (uint8_t)((LCD_ROT + 2) % 4);
+    case BUDDY_SCREEN_ROTATION_270:
+      return (uint8_t)((LCD_ROT + 3) % 4);
+    default:
+      return LCD_ROT;
+  }
 }
 
 const char* buddyOrientationStr(uint8_t orientation) {
-  return orientation == BUDDY_SCREEN_DOWN ? "down" : "up";
+  switch (clampBuddyOrientation(orientation)) {
+    case BUDDY_SCREEN_ROTATION_90: return "90deg";
+    case BUDDY_SCREEN_ROTATION_180: return "180deg";
+    case BUDDY_SCREEN_ROTATION_270: return "270deg";
+    default: return "360deg";
+  }
 }
 
 void applyBuddyScreenOrientation(uint8_t orientation) {
@@ -617,6 +663,24 @@ void updateBatterySample(unsigned long now) {
     BUDDY_BATTERY_ADC_PIN, (unsigned long)adcMv, (unsigned long)vbatMv, batteryPercent);
 #else
   (void)now;
+#endif
+}
+
+void notifyBatteryPercentIfNeeded() {
+#if BUDDY_BATTERY_ADC_PIN >= 0
+  int16_t percent = batteryPercent;
+  bool canNotify = false;
+  portENTER_CRITICAL(&bleMux);
+  canNotify = bleConnected && pairAuthenticated && percent >= 0;
+  portEXIT_CRITICAL(&bleMux);
+  if (!canNotify || pNotifyChar == nullptr) return;
+  if (lastBatteryNotifyPercent == percent) return;
+
+  uint8_t payload[2] = { BUDDY_BATTERY_FRAME, (uint8_t)percent };
+  pNotifyChar->setValue(payload, 2);
+  pNotifyChar->notify();
+  lastBatteryNotifyPercent = percent;
+  Serial.printf("[BAT]  Notify percent=%d%%\n", percent);
 #endif
 }
 
@@ -928,6 +992,15 @@ static bool buddyAudioSetMute(bool muted) {
   return buddyAudioWriteReg(0x31, reg31);
 }
 
+static uint8_t buddyAudioVolumeRegValue(uint8_t volume) {
+  uint8_t clamped = clampBuddyVolume(volume);
+  return clamped == 0 ? 0 : (uint8_t)((clamped * 256 / 100) - 1);
+}
+
+static bool buddyAudioApplyVolume(uint8_t volume) {
+  return buddyAudioWriteReg(0x32, buddyAudioVolumeRegValue(volume));
+}
+
 static bool buddyAudioCodecInit() {
   bool ok = true;
   ok &= buddyAudioWriteReg(0x00, 0x1F);
@@ -956,11 +1029,7 @@ static bool buddyAudioCodecInit() {
   ok &= buddyAudioWriteReg(0x1C, 0x6A);
   ok &= buddyAudioWriteReg(0x37, 0x08);
 
-  int volume = BUDDY_AUDIO_VOLUME;
-  if (volume < 0) volume = 0;
-  if (volume > 100) volume = 100;
-  uint8_t reg32 = volume == 0 ? 0 : (uint8_t)((volume * 256 / 100) - 1);
-  ok &= buddyAudioWriteReg(0x32, reg32);
+  ok &= buddyAudioApplyVolume(currentBuddySpeakerVolumePercent());
   ok &= buddyAudioSetMute(true);
   return ok;
 }
@@ -1063,7 +1132,14 @@ static void buddyAudioPlayCompletionBeep() {
   if (now - lastBuddyAudioBeepMs < BUDDY_AUDIO_COOLDOWN_MS) return;
   lastBuddyAudioBeepMs = now;
 
+  uint8_t runtimeVolume = currentBuddySpeakerVolumePercent();
+  if (runtimeVolume == 0) {
+    Serial.println("[AUDIO] Task complete beep muted");
+    return;
+  }
+
   if (!buddyAudioEnsureReady() || !buddyAudioEnableI2S()) return;
+  buddyAudioApplyVolume(runtimeVolume);
 
   buddyAudioWriteSilence(32);
   digitalWrite(BUDDY_AUDIO_PA_CTRL, HIGH);
@@ -1132,12 +1208,14 @@ class ServerCallbacks : public BLEServerCallbacks {
     rememberBleConnection(pServer->getConnId());
     bleConnected = true;
     pairAuthenticated = false;
+    lastBatteryNotifyPercent = -1;
     Serial.println("[BLE] Connected, waiting for pair handshake...");
   }
   void onDisconnect(BLEServer* pServer) override {
     bleConnected = false;
     clearBleConnection();
     pairAuthenticated = false;
+    lastBatteryNotifyPercent = -1;
     if (appMode == MODE_PAIR_CONFIRM) {
       appMode = MODE_ONBOARD;
       Serial.println("[BLE] Disconnected during pairing, back to ONBOARD");
@@ -1148,9 +1226,11 @@ class ServerCallbacks : public BLEServerCallbacks {
 #if defined(CONFIG_BLUEDROID_ENABLED)
   void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override {
     rememberBleConnection(param->connect.conn_id);
+    lastBatteryNotifyPercent = -1;
   }
   void onDisconnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override {
     clearBleConnection();
+    lastBatteryNotifyPercent = -1;
   }
 #endif
 };
@@ -1295,6 +1375,23 @@ class CharCallbacks : public BLECharacteristicCallbacks {
       portEXIT_CRITICAL(&bleMux);
       lastInteraction = millis();
       Serial.printf("[BLE] Screen orientation config: %s\n", buddyOrientationStr(orientation));
+      return;
+    }
+
+    if (len == 2 && data[0] == BUDDY_VOLUME_FRAME) {
+      uint8_t percent = clampBuddyVolume(data[1]);
+      portENTER_CRITICAL(&bleMux);
+      buddySpeakerVolumePercent = percent;
+      nvsDirty = true;
+      portEXIT_CRITICAL(&bleMux);
+#if BUDDY_AUDIO_ENABLED
+      if (buddyAudioReady) {
+        buddyAudioApplyVolume(percent);
+        if (percent == 0) buddyAudioSetMute(true);
+      }
+#endif
+      lastInteraction = millis();
+      Serial.printf("[BLE] Speaker volume config: %d%%\n", percent);
       return;
     }
 
@@ -2078,10 +2175,11 @@ void setup() {
 
   // NVS — restore persisted settings
   prefs.begin("buddy", false);
-  buddyBrightnessPercent = prefs.getUChar("bright", BUDDY_BRIGHTNESS_DEFAULT_PERCENT);
-  buddyScreenOrientation = prefs.getUChar("orient", BUDDY_SCREEN_UP);
-  Serial.printf("[NVS]  Restored brightness=%d%% orientation=%s\n",
-    buddyBrightnessPercent, buddyOrientationStr(buddyScreenOrientation));
+  buddyBrightnessPercent = clampBuddyBrightness(prefs.getUChar("bright", BUDDY_BRIGHTNESS_DEFAULT_PERCENT));
+  buddyScreenOrientation = clampBuddyOrientation(prefs.getUChar("orient", BUDDY_SCREEN_UP));
+  buddySpeakerVolumePercent = clampBuddyVolume(prefs.getUChar("volume", BUDDY_VOLUME_DEFAULT_PERCENT));
+  Serial.printf("[NVS]  Restored brightness=%d%% orientation=%s volume=%d%%\n",
+    buddyBrightnessPercent, buddyOrientationStr(buddyScreenOrientation), buddySpeakerVolumePercent);
 
   // NVS — restore pairing state
   isPaired = prefs.getBool("ps", false);
@@ -2247,6 +2345,7 @@ void loop() {
   }
 
   updateBatterySample(now);
+  notifyBatteryPercentIfNeeded();
 
   float t = now / 1000.0f;
 
@@ -2604,10 +2703,12 @@ void loop() {
     bool shouldSaveNvs = false;
     uint8_t nvsBrightness = BUDDY_BRIGHTNESS_DEFAULT_PERCENT;
     uint8_t nvsOrientation = BUDDY_SCREEN_UP;
+    uint8_t nvsVolume = BUDDY_VOLUME_DEFAULT_PERCENT;
     portENTER_CRITICAL(&bleMux);
     if (nvsDirty) {
       nvsBrightness = buddyBrightnessPercent;
       nvsOrientation = buddyScreenOrientation;
+      nvsVolume = buddySpeakerVolumePercent;
       nvsDirty = false;
       shouldSaveNvs = true;
     }
@@ -2615,9 +2716,10 @@ void loop() {
     if (shouldSaveNvs) {
       prefs.putUChar("bright", nvsBrightness);
       prefs.putUChar("orient", nvsOrientation);
+      prefs.putUChar("volume", nvsVolume);
       lastNvsSave = now;
-      Serial.printf("[NVS]  Saved brightness=%d%% orientation=%s\n",
-        nvsBrightness, buddyOrientationStr(nvsOrientation));
+      Serial.printf("[NVS]  Saved brightness=%d%% orientation=%s volume=%d%%\n",
+        nvsBrightness, buddyOrientationStr(nvsOrientation), nvsVolume);
     }
   }
 

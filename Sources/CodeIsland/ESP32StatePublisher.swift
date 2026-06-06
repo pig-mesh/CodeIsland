@@ -23,7 +23,8 @@ final class ESP32StatePublisher {
     private var taskRunTracker = BuddyTaskRunTracker()
     private var heartbeatInterval: TimeInterval = 5.0
     private var brightnessPercent: Double = Double(ESP32Protocol.defaultBrightnessPercent)
-    private var screenOrientation: BuddyScreenOrientation = .up
+    private var speakerVolumePercent: Double = Double(ESP32Protocol.defaultVolumePercent)
+    private var screenOrientation: BuddyScreenOrientation = .degrees360
     private var keepAliveActivity: NSObjectProtocol?
     private var interactiveRetryTask: Task<Void, Never>?
     private var lastSentDisplay: SentDisplayState?
@@ -53,11 +54,13 @@ final class ESP32StatePublisher {
         enabled: Bool,
         heartbeatSeconds: Double,
         brightnessPercent: Double,
-        screenOrientation: BuddyScreenOrientation
+        screenOrientation: BuddyScreenOrientation,
+        speakerVolumePercent: Double
     ) {
         self.heartbeatInterval = max(1.0, heartbeatSeconds)
         self.brightnessPercent = Double(ESP32Protocol.clampedBrightnessPercent(brightnessPercent))
         self.screenOrientation = screenOrientation
+        self.speakerVolumePercent = Double(ESP32Protocol.clampedVolumePercent(speakerVolumePercent))
         heartbeatTimer?.invalidate()
         heartbeatTimer = nil
         taskRunTimer?.invalidate()
@@ -175,6 +178,7 @@ final class ESP32StatePublisher {
     private func syncConfig() {
         bridge.sendBrightness(percent: brightnessPercent)
         bridge.sendScreenOrientation(screenOrientation)
+        bridge.sendVolume(percent: speakerVolumePercent)
     }
 
     private func beginKeepAliveActivityIfNeeded() {

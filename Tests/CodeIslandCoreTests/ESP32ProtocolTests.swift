@@ -85,14 +85,33 @@ final class ESP32ProtocolTests: XCTestCase {
         XCTAssertEqual(BuddyBrightnessPayload(percent: Double.nan).percent, ESP32Protocol.defaultBrightnessPercent)
     }
 
+    func testEncodeVolumeConfigFrame() {
+        let frame = BuddyVolumePayload(percent: UInt8(60))
+        XCTAssertEqual(Array(frame.encode()), [ESP32Protocol.volumeFrameMarker, 60])
+    }
+
+    func testVolumeConfigClampsToSupportedRange() {
+        XCTAssertEqual(BuddyVolumePayload(percent: -1.0).percent, ESP32Protocol.minVolumePercent)
+        XCTAssertEqual(BuddyVolumePayload(percent: 150.0).percent, ESP32Protocol.maxVolumePercent)
+        XCTAssertEqual(BuddyVolumePayload(percent: Double.nan).percent, ESP32Protocol.defaultVolumePercent)
+    }
+
     func testEncodeScreenOrientationConfigFrame() {
         XCTAssertEqual(
-            Array(BuddyScreenOrientationPayload(orientation: .up).encode()),
+            Array(BuddyScreenOrientationPayload(orientation: .degrees360).encode()),
             [ESP32Protocol.orientationFrameMarker, 0]
         )
         XCTAssertEqual(
-            Array(BuddyScreenOrientationPayload(orientation: .down).encode()),
+            Array(BuddyScreenOrientationPayload(orientation: .degrees180).encode()),
             [ESP32Protocol.orientationFrameMarker, 1]
+        )
+        XCTAssertEqual(
+            Array(BuddyScreenOrientationPayload(orientation: .degrees90).encode()),
+            [ESP32Protocol.orientationFrameMarker, 2]
+        )
+        XCTAssertEqual(
+            Array(BuddyScreenOrientationPayload(orientation: .degrees270).encode()),
+            [ESP32Protocol.orientationFrameMarker, 3]
         )
     }
 
@@ -122,11 +141,25 @@ final class ESP32ProtocolTests: XCTestCase {
         XCTAssertEqual(String(data: frame.encode().subdata(in: 4..<frame.encode().count), encoding: .utf8), "generated ")
     }
 
-    func testScreenOrientationDefaultsToUpForUnknownValues() {
-        XCTAssertEqual(BuddyScreenOrientation(settingsValue: "down"), .down)
-        XCTAssertEqual(BuddyScreenOrientation(settingsValue: "sideways"), .up)
-        XCTAssertEqual(BuddyScreenOrientation(wireValue: 1), .down)
-        XCTAssertEqual(BuddyScreenOrientation(wireValue: 7), .up)
+    func testScreenOrientationDefaultsTo360ForUnknownValues() {
+        XCTAssertEqual(BuddyScreenOrientation(settingsValue: "90"), .degrees90)
+        XCTAssertEqual(BuddyScreenOrientation(settingsValue: "180"), .degrees180)
+        XCTAssertEqual(BuddyScreenOrientation(settingsValue: "270"), .degrees270)
+        XCTAssertEqual(BuddyScreenOrientation(settingsValue: "360"), .degrees360)
+        XCTAssertEqual(BuddyScreenOrientation(settingsValue: "down"), .degrees180)
+        XCTAssertEqual(BuddyScreenOrientation(settingsValue: "up"), .degrees360)
+        XCTAssertEqual(BuddyScreenOrientation(settingsValue: "sideways"), .degrees360)
+        XCTAssertEqual(BuddyScreenOrientation(wireValue: 1), .degrees180)
+        XCTAssertEqual(BuddyScreenOrientation(wireValue: 2), .degrees90)
+        XCTAssertEqual(BuddyScreenOrientation(wireValue: 3), .degrees270)
+        XCTAssertEqual(BuddyScreenOrientation(wireValue: 7), .degrees360)
+    }
+
+    func testScreenOrientationQuarterTurnCyclesClockwise() {
+        XCTAssertEqual(BuddyScreenOrientation.degrees360.nextQuarterTurn, .degrees90)
+        XCTAssertEqual(BuddyScreenOrientation.degrees90.nextQuarterTurn, .degrees180)
+        XCTAssertEqual(BuddyScreenOrientation.degrees180.nextQuarterTurn, .degrees270)
+        XCTAssertEqual(BuddyScreenOrientation.degrees270.nextQuarterTurn, .degrees360)
     }
 
     func testConvenienceInitFromSourceString() {
@@ -397,6 +430,22 @@ final class ESP32ProtocolTests: XCTestCase {
     func testBuddyUplinkEventParsesPairPending() {
         let event = BuddyUplinkEvent(payload: Data([ESP32Protocol.pairPendingMarker]))
         XCTAssertEqual(event, .pairResponse(.pending))
+    }
+
+    func testBuddyUplinkEventParsesBatteryFrame() {
+        XCTAssertEqual(
+            BuddyUplinkEvent(payload: Data([ESP32Protocol.batteryFrameMarker, 78])),
+            .battery(BuddyBatteryPayload(percent: 78))
+        )
+    }
+
+    func testBuddyUplinkEventRejectsShortBatteryFrame() {
+        XCTAssertNil(BuddyUplinkEvent(payload: Data([ESP32Protocol.batteryFrameMarker])))
+    }
+
+    func testBuddyBatteryPayloadClampsPercent() {
+        XCTAssertEqual(BuddyBatteryPayload(percent: -10).percent, 0)
+        XCTAssertEqual(BuddyBatteryPayload(percent: 140).percent, 100)
     }
 
     func testBuddyUplinkEventEmptyPayloadReturnsNil() {

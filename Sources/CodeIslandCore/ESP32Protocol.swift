@@ -31,7 +31,11 @@ import Foundation
 ///
 /// Screen orientation config frame:
 ///   byte[0] = 0xFD
-///   byte[1] = orientation (0=up, 1=down)
+///   byte[1] = orientation (0=360/default, 1=180/legacy down, 2=90, 3=270)
+///
+/// Speaker volume config frame:
+///   byte[0] = 0xEE
+///   byte[1] = volume percentage (0..100)
 ///
 /// Downlink pair request frame (7 bytes):
 ///   byte[0] = 0xE0
@@ -56,7 +60,8 @@ import Foundation
 /// Uplink (button notify / notification action):
 ///   1 byte = currently displayed mascot sourceId (focus request), or
 ///   1 byte = control opcode (approve / deny / skip), or
-///   1 byte = pairing response (0xE0 accepted, 0xE1 rejected, 0xE2 pending).
+///   1 byte = pairing response (0xE0 accepted, 0xE1 rejected, 0xE2 pending), or
+///   2 bytes = battery report (0xED, percentage 0..100).
 ///
 /// **Pairing security model:**
 /// The application-layer pairing is NOT a cryptographic authentication mechanism.
@@ -85,6 +90,8 @@ public enum ESP32Protocol {
     public static let maxMessagePreviewFrameBytes = 4 + maxMessagePreviewBytes
     public static let brightnessFrameMarker: UInt8 = 0xFE
     public static let orientationFrameMarker: UInt8 = 0xFD
+    public static let volumeFrameMarker: UInt8 = 0xEE
+    public static let batteryFrameMarker: UInt8 = 0xED
     public static let workspaceFrameMarker: UInt8 = 0xFC
     public static let messagePreviewFrameMarker: UInt8 = 0xFB
     public static let modelFrameMarker: UInt8 = 0xF9
@@ -136,6 +143,9 @@ public enum ESP32Protocol {
     public static let minBrightnessPercent: UInt8 = 10
     public static let maxBrightnessPercent: UInt8 = 100
     public static let defaultBrightnessPercent: UInt8 = 70
+    public static let minVolumePercent: UInt8 = 0
+    public static let maxVolumePercent: UInt8 = 100
+    public static let defaultVolumePercent: UInt8 = 60
     /// Firmware's Bluetooth inactivity timeout (ms). Host should stay well under this.
     public static let firmwareInactivityTimeoutMs: Int = 60_000
 
@@ -144,6 +154,14 @@ public enum ESP32Protocol {
         let rounded = Int(percent.rounded())
         let minValue = Int(minBrightnessPercent)
         let maxValue = Int(maxBrightnessPercent)
+        return UInt8(min(max(rounded, minValue), maxValue))
+    }
+
+    public static func clampedVolumePercent(_ percent: Double) -> UInt8 {
+        guard percent.isFinite else { return defaultVolumePercent }
+        let rounded = Int(percent.rounded())
+        let minValue = Int(minVolumePercent)
+        let maxValue = Int(maxVolumePercent)
         return UInt8(min(max(rounded, minValue), maxValue))
     }
 }
@@ -160,13 +178,35 @@ public enum BuddyPairResponse: UInt8, Equatable, Sendable {
     case pending = 0xE2
 }
 
+/// Battery percentage reported by Buddy over the notify characteristic.
+public struct BuddyBatteryPayload: Equatable, Sendable {
+    public let percent: UInt8
+
+    public init(percent: Int) {
+        self.percent = UInt8(min(100, max(0, percent)))
+    }
+
+    public init?(data: Data) {
+        guard data.count >= 2,
+              data[0] == ESP32Protocol.batteryFrameMarker else {
+            return nil
+        }
+        self.init(percent: Int(data[1]))
+    }
+}
+
 public enum BuddyUplinkEvent: Equatable, Sendable {
     case focus(MascotID)
     case command(BuddyControlCommand)
     case pairResponse(BuddyPairResponse)
+    case battery(BuddyBatteryPayload)
 
     public init?(payload: Data) {
         guard let first = payload.first else { return nil }
+        if let battery = BuddyBatteryPayload(data: payload) {
+            self = .battery(battery)
+            return
+        }
         // Pair responses (0xE0–0xE2) are checked first. This is safe because
         // MascotID raw values are 0..15, well below the 0xE0 reserved range.
         // If MascotID ever grows past 0xDF this ordering MUST be revisited.
@@ -186,31 +226,49 @@ public enum BuddyUplinkEvent: Equatable, Sendable {
     }
 }
 
-/// Physical screen orientation for Buddy.
+/// Physical screen rotation for Buddy.
 public enum BuddyScreenOrientation: String, CaseIterable, Identifiable, Sendable {
-    case up
-    case down
+    case degrees90 = "90"
+    case degrees180 = "180"
+    case degrees270 = "270"
+    case degrees360 = "360"
 
     public var id: String { rawValue }
 
     public var wireValue: UInt8 {
         switch self {
-        case .up: return 0
-        case .down: return 1
+        case .degrees360: return 0
+        case .degrees180: return 1
+        case .degrees90: return 2
+        case .degrees270: return 3
         }
     }
 
     public init(settingsValue: String?) {
         switch settingsValue {
-        case Self.down.rawValue: self = .down
-        default: self = .up
+        case Self.degrees90.rawValue: self = .degrees90
+        case Self.degrees180.rawValue, "down": self = .degrees180
+        case Self.degrees270.rawValue: self = .degrees270
+        case Self.degrees360.rawValue, "up": self = .degrees360
+        default: self = .degrees360
         }
     }
 
     public init(wireValue: UInt8) {
         switch wireValue {
-        case 1: self = .down
-        default: self = .up
+        case 1: self = .degrees180
+        case 2: self = .degrees90
+        case 3: self = .degrees270
+        default: self = .degrees360
+        }
+    }
+
+    public var nextQuarterTurn: BuddyScreenOrientation {
+        switch self {
+        case .degrees360: return .degrees90
+        case .degrees90: return .degrees180
+        case .degrees180: return .degrees270
+        case .degrees270: return .degrees360
         }
     }
 }
@@ -435,6 +493,23 @@ public struct BuddyBrightnessPayload: Equatable, Sendable {
 
     public func encode() -> Data {
         Data([ESP32Protocol.brightnessFrameMarker, percent])
+    }
+}
+
+/// Encoded Buddy speaker cue volume config.
+public struct BuddyVolumePayload: Equatable, Sendable {
+    public let percent: UInt8
+
+    public init(percent: Double) {
+        self.percent = ESP32Protocol.clampedVolumePercent(percent)
+    }
+
+    public init(percent: UInt8) {
+        self.percent = ESP32Protocol.clampedVolumePercent(Double(percent))
+    }
+
+    public func encode() -> Data {
+        Data([ESP32Protocol.volumeFrameMarker, percent])
     }
 }
 

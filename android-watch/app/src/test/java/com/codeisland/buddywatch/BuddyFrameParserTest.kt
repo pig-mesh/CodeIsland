@@ -27,9 +27,16 @@ class BuddyFrameParserTest {
 
     @Test
     fun `parse orientation frame`() {
-        val result = BuddyFrameParser.parse(byteArrayOf(0xFD.toByte(), 0x01))
+        val result = BuddyFrameParser.parse(byteArrayOf(0xFD.toByte(), 0x02))
 
-        assertEquals(IncomingCommand.Orientation(1), result)
+        assertEquals(IncomingCommand.Orientation(2), result)
+    }
+
+    @Test
+    fun `clamp unknown orientation frame`() {
+        val result = BuddyFrameParser.parse(byteArrayOf(0xFD.toByte(), 0x07))
+
+        assertEquals(IncomingCommand.Orientation(0), result)
     }
 
     @Test

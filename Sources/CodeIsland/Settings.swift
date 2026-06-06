@@ -90,6 +90,7 @@ enum SettingsKey {
     static let esp32BridgeEnabled = "esp32BridgeEnabled"
     static let esp32HeartbeatSeconds = "esp32HeartbeatSeconds"
     static let buddyScreenBrightnessPercent = "buddyScreenBrightnessPercent"
+    static let buddySpeakerVolumePercent = "buddySpeakerVolumePercent"
     static let buddyScreenOrientation = "buddyScreenOrientation"
     static let selectedBuddyIdentifier = "selectedBuddyIdentifier"
     static let selectedBuddyName = "selectedBuddyName"
@@ -155,7 +156,8 @@ struct SettingsDefaults {
     static let esp32BridgeEnabled = false
     static let esp32HeartbeatSeconds = 5.0
     static let buddyScreenBrightnessPercent = 70.0
-    static let buddyScreenOrientation = "up"
+    static let buddySpeakerVolumePercent = 60.0
+    static let buddyScreenOrientation = "360"
     static let selectedBuddyIdentifier = ""
     static let selectedBuddyName = ""
 
@@ -217,6 +219,7 @@ class SettingsManager {
             SettingsKey.esp32BridgeEnabled: SettingsDefaults.esp32BridgeEnabled,
             SettingsKey.esp32HeartbeatSeconds: SettingsDefaults.esp32HeartbeatSeconds,
             SettingsKey.buddyScreenBrightnessPercent: SettingsDefaults.buddyScreenBrightnessPercent,
+            SettingsKey.buddySpeakerVolumePercent: SettingsDefaults.buddySpeakerVolumePercent,
             SettingsKey.buddyScreenOrientation: SettingsDefaults.buddyScreenOrientation,
             SettingsKey.selectedBuddyIdentifier: SettingsDefaults.selectedBuddyIdentifier,
             SettingsKey.selectedBuddyName: SettingsDefaults.selectedBuddyName,

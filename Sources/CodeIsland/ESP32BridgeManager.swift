@@ -128,6 +128,8 @@ final class ESP32BridgeManager: NSObject {
     private(set) var selectedBuddyIdentifier: UUID?
     private(set) var selectedBuddyName: String?
     private(set) var usesLegacyPairingFallback = false
+    private(set) var buddyBatteryPercent: UInt8?
+    private(set) var buddyBatteryLastUpdated: Date?
 
     // Backoff table (seconds) mirrors Buddy's 1→2→4→8→…30 exponential.
     private static let reconnectBackoff: [Int] = [1, 2, 4, 8, 16, 30]
@@ -218,6 +220,7 @@ final class ESP32BridgeManager: NSObject {
         notifyChar = nil
         notifySubscriptionReady = false
         resetPendingWrites()
+        clearBuddyTelemetry()
         connectedPeripheralName = nil
         usesLegacyPairingFallback = false
         central?.delegate = nil
@@ -257,8 +260,12 @@ final class ESP32BridgeManager: NSObject {
 
     /// Persist the user's Buddy choice and (re)connect to it.
     func select(buddyId: UUID) {
+        let previousSelectedBuddyIdentifier = selectedBuddyIdentifier
         let entry = discovered.first(where: { $0.id == buddyId })
         selectedBuddyIdentifier = buddyId
+        if previousSelectedBuddyIdentifier != buddyId {
+            clearBuddyTelemetry()
+        }
         selectedBuddyName = entry?.name ?? selectedBuddyName
         defaults.set(buddyId.uuidString, forKey: SettingsKey.selectedBuddyIdentifier)
         if let n = selectedBuddyName {
@@ -323,6 +330,7 @@ final class ESP32BridgeManager: NSObject {
         notifyChar = nil
         notifySubscriptionReady = false
         resetPendingWrites()
+        clearBuddyTelemetry()
         connectedPeripheralName = nil
         usesLegacyPairingFallback = false
         selectedBuddyIdentifier = nil
@@ -402,6 +410,11 @@ final class ESP32BridgeManager: NSObject {
         send(BuddyBrightnessPayload(percent: percent).encode(), priority: .control)
     }
 
+    /// Write Buddy speaker cue volume. No-op when not connected.
+    func sendVolume(percent: Double) {
+        send(BuddyVolumePayload(percent: percent).encode(), priority: .control)
+    }
+
     /// Write Buddy screen orientation. No-op when not connected.
     func sendScreenOrientation(_ orientation: BuddyScreenOrientation) {
         send(BuddyScreenOrientationPayload(orientation: orientation).encode(), priority: .control)
@@ -466,6 +479,11 @@ final class ESP32BridgeManager: NSObject {
 
     private func resetPendingWrites() {
         pendingWriteQueue.removeAll(keepingCapacity: false)
+    }
+
+    private func clearBuddyTelemetry() {
+        buddyBatteryPercent = nil
+        buddyBatteryLastUpdated = nil
     }
 
     private static let hostIdDefaultsKey = "buddyHostIdentifier"
@@ -1027,6 +1045,10 @@ extension ESP32BridgeManager: CBPeripheralDelegate {
             switch event {
             case .pairResponse(let response):
                 self.handlePairResponse(response)
+            case .battery(let payload):
+                self.buddyBatteryPercent = payload.percent
+                self.buddyBatteryLastUpdated = Date()
+                Self.log.info("Buddy battery: \(payload.percent)%")
             case .focus(let mascot):
                 Self.log.info("Button event: mascot=\(mascot.sourceName)")
                 self.onFocusRequest?(mascot)

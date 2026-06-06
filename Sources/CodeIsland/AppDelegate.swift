@@ -67,11 +67,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let buddyScreenOrientation = BuddyScreenOrientation(
             settingsValue: UserDefaults.standard.string(forKey: SettingsKey.buddyScreenOrientation)
         )
+        let buddySpeakerVolume: Double
+        if let storedBuddySpeakerVolume = UserDefaults.standard.object(forKey: SettingsKey.buddySpeakerVolumePercent) as? Double {
+            buddySpeakerVolume = storedBuddySpeakerVolume
+        } else {
+            buddySpeakerVolume = SettingsDefaults.buddySpeakerVolumePercent
+        }
         ESP32StatePublisher.shared.configure(
             enabled: buddyEnabled,
             heartbeatSeconds: buddySyncInterval > 0 ? buddySyncInterval : SettingsDefaults.esp32HeartbeatSeconds,
             brightnessPercent: buddyBrightness > 0 ? buddyBrightness : SettingsDefaults.buddyScreenBrightnessPercent,
-            screenOrientation: buddyScreenOrientation
+            screenOrientation: buddyScreenOrientation,
+            speakerVolumePercent: buddySpeakerVolume
         )
 
         // Hooks auto-recovery: periodic + app activation trigger

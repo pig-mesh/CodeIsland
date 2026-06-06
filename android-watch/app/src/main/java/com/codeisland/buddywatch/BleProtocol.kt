@@ -56,7 +56,8 @@ object BuddyFrameParser {
         }
 
         if (marker == BleProtocol.orientationFrameMarker && payload.size >= 2) {
-            return IncomingCommand.Orientation(if (payload[1].toInt() == 1) 1 else 0)
+            val wireValue = payload[1].toUByte().toInt()
+            return IncomingCommand.Orientation(if (wireValue in 0..3) wireValue else 0)
         }
 
         if (marker == BleProtocol.workspaceFrameMarker && payload.size >= 2) {

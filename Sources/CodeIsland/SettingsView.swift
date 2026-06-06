@@ -1241,6 +1241,7 @@ private struct BuddyPage: View {
     @AppStorage(SettingsKey.esp32BridgeEnabled) private var enabled: Bool = SettingsDefaults.esp32BridgeEnabled
     @AppStorage(SettingsKey.esp32HeartbeatSeconds) private var heartbeat: Double = SettingsDefaults.esp32HeartbeatSeconds
     @AppStorage(SettingsKey.buddyScreenBrightnessPercent) private var brightness: Double = SettingsDefaults.buddyScreenBrightnessPercent
+    @AppStorage(SettingsKey.buddySpeakerVolumePercent) private var speakerVolume: Double = SettingsDefaults.buddySpeakerVolumePercent
     @AppStorage(SettingsKey.buddyScreenOrientation) private var screenOrientation: String = SettingsDefaults.buddyScreenOrientation
     @State private var refreshTick = 0
 
@@ -1293,8 +1294,40 @@ private struct BuddyPage: View {
             enabled: enabled,
             heartbeatSeconds: heartbeat,
             brightnessPercent: brightness,
-            screenOrientation: BuddyScreenOrientation(settingsValue: screenOrientation)
+            screenOrientation: BuddyScreenOrientation(settingsValue: screenOrientation),
+            speakerVolumePercent: speakerVolume
         )
+    }
+
+    private var currentScreenOrientation: BuddyScreenOrientation {
+        BuddyScreenOrientation(settingsValue: screenOrientation)
+    }
+
+    private var screenOrientationText: String {
+        "\(currentScreenOrientation.rawValue)°"
+    }
+
+    private func rotateScreenQuarterTurn() {
+        screenOrientation = currentScreenOrientation.nextQuarterTurn.rawValue
+        configurePublisher()
+    }
+
+    private var batteryPercentText: String {
+        _ = refreshTick
+        guard let percent = bridge.buddyBatteryPercent else {
+            return l10n["buddy_battery_not_reported"]
+        }
+        return "\(percent)%"
+    }
+
+    private var batteryFreshnessText: String? {
+        _ = refreshTick
+        guard bridge.buddyBatteryPercent != nil,
+              let updatedAt = bridge.buddyBatteryLastUpdated else {
+            return nil
+        }
+        let seconds = max(0, Int(Date().timeIntervalSince(updatedAt).rounded()))
+        return String(format: l10n["buddy_battery_updated_seconds_ago"], seconds)
     }
 
     var body: some View {
@@ -1433,6 +1466,27 @@ private struct BuddyPage: View {
                 }
             }
 
+            Section(l10n["buddy_device_status"]) {
+                HStack {
+                    Text(l10n["buddy_battery"])
+                    Spacer()
+                    Text(batteryPercentText)
+                        .font(.system(
+                            size: bridge.buddyBatteryPercent == nil ? 13 : 20,
+                            weight: .semibold,
+                            design: .rounded
+                        ))
+                        .foregroundStyle(bridge.buddyBatteryPercent == nil ? .secondary : .primary)
+                        .monospacedDigit()
+                }
+
+                if let batteryFreshnessText {
+                    Text(batteryFreshnessText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Section(l10n["buddy_sync"]) {
                 HStack {
                     Text(l10n["buddy_sync_interval"])
@@ -1450,7 +1504,7 @@ private struct BuddyPage: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section(l10n["buddy_display"]) {
+            Section(l10n["buddy_device_controls"]) {
                 HStack {
                     Text(l10n["buddy_brightness"])
                     Spacer()
@@ -1467,13 +1521,36 @@ private struct BuddyPage: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                Picker(l10n["buddy_screen_orientation"], selection: $screenOrientation) {
-                    Text(l10n["buddy_screen_orientation_up"]).tag(BuddyScreenOrientation.up.rawValue)
-                    Text(l10n["buddy_screen_orientation_down"]).tag(BuddyScreenOrientation.down.rawValue)
+                HStack {
+                    Text(l10n["buddy_speaker_volume"])
+                    Spacer()
+                    Text("\(Int(speakerVolume.rounded()))%")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
                 }
-                .pickerStyle(.segmented)
-                .onChange(of: screenOrientation) { _, _ in
-                    configurePublisher()
+                Slider(value: $speakerVolume, in: Double(ESP32Protocol.minVolumePercent)...Double(ESP32Protocol.maxVolumePercent), step: 1)
+                    .onChange(of: speakerVolume) { _, newValue in
+                        speakerVolume = Double(ESP32Protocol.clampedVolumePercent(newValue))
+                        configurePublisher()
+                    }
+                Text(l10n["buddy_speaker_volume_desc"])
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(l10n["buddy_screen_orientation"])
+                        Text(String(format: l10n["buddy_screen_orientation_current"], screenOrientationText))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Spacer()
+                    Button {
+                        rotateScreenQuarterTurn()
+                    } label: {
+                        Label(l10n["buddy_screen_rotate_90"], systemImage: "rotate.right")
+                    }
                 }
                 Text(l10n["buddy_screen_orientation_desc"])
                     .font(.caption)
